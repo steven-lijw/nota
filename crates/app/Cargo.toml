@@ -1,0 +1,27 @@
+[package]
+name = "nota"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "nota"
+path = "src/main.rs"
+
+[features]
+default = ["runtime-shaders"]
+# Compile Metal shaders at runtime so the app builds with only the Xcode
+# Command Line Tools installed (no full Xcode needed).
+runtime-shaders = ["gpui/runtime_shaders"]
+
+[dependencies]
+nota-core = { path = "../core" }
+gpui = "0.2.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+smol = "2"
+futures = "0.3"
+unicode-segmentation = "1"
+dirs = "5"
+log = "0.4"
