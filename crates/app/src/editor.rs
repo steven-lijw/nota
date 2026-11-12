@@ -27,6 +27,8 @@ pub enum EditorEvent {
     OpenPage(String),
     /// Arrow-up from the very first block.
     FocusTitle,
+    /// "Ask AI" on the selection toolbar.
+    AskAi,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -148,6 +150,23 @@ pub struct Marquee {
     pub active: bool,
     /// Started below the last block: a plain click there adds a line.
     pub from_tail: bool,
+}
+
+/// The part of the page a question to Nota AI was about.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AiTarget {
+    /// Selected text inside one block.
+    Text { block: u64, range: Range<usize> },
+    /// Whole selected blocks (first and last, by runtime id).
+    Blocks { first: u64, last: u64 },
+}
+
+/// What the AI panel shows and sends for the current selection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AiSelection {
+    pub markdown: String,
+    pub preview: String,
+    pub target: AiTarget,
 }
 
 /// Dragging one of an image's side handles.
@@ -1995,6 +2014,73 @@ impl Editor {
         cx.notify();
     }
 
+    /// The current selection, for Nota AI.
+    pub fn ai_selection(&self) -> Option<AiSelection> {
+        let (plain, markdown) = self.clipboard_contents()?;
+        if plain.trim().is_empty() {
+            return None;
+        }
+        let target = match self.block_sel_range() {
+            Some(r) => {
+                let r = expand_to_subtrees(&self.blocks, r);
+                AiTarget::Blocks { first: self.blocks[r.start].id, last: self.blocks[r.end - 1].id }
+            }
+            None => AiTarget::Text { block: self.cur().id, range: self.sel.range.clone() },
+        };
+        let flat = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview: String = flat.chars().take(48).collect();
+        let preview = if flat.chars().count() > 48 { format!("{preview}…") } else { preview };
+        Some(AiSelection { markdown, preview, target })
+    }
+
+    /// Put an AI answer into the page: in place of `target` (`replace`) or
+    /// right below it. Returns false if the target no longer exists.
+    pub fn apply_ai(&mut self, md: &str, target: &AiTarget, replace: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let mut blocks = from_markdown(md);
+        if blocks.is_empty() {
+            return true;
+        }
+        let range = match target {
+            AiTarget::Text { block, range } => {
+                let Some(ix) = self.index_of(*block) else { return false };
+                if replace && self.blocks[ix].kind.has_text() {
+                    let len = self.blocks[ix].text.len();
+                    let text = &self.blocks[ix].text.text;
+                    let r = clamp(text, range.start.min(len))..clamp(text, range.end.min(len));
+                    self.block_sel = None;
+                    self.sel = Sel { block: ix, range: r, reversed: false };
+                    window.focus(&self.focus);
+                    self.insert_markdown(md.to_string(), true, cx);
+                    return true;
+                }
+                ix..subtree_end(&self.blocks, ix)
+            }
+            AiTarget::Blocks { first, last } => {
+                let (Some(a), Some(b)) = (self.index_of(*first), self.index_of(*last)) else { return false };
+                expand_to_subtrees(&self.blocks, a.min(b)..a.max(b) + 1)
+            }
+        };
+        self.checkpoint(EditKind::Other);
+        let indent = self.blocks[range.start].indent;
+        for b in &mut blocks {
+            b.indent = b.indent.saturating_add(indent);
+        }
+        let n = blocks.len();
+        let at = if replace {
+            self.blocks.splice(range.clone(), blocks);
+            range.start
+        } else {
+            self.blocks.splice(range.end..range.end, blocks);
+            range.end
+        };
+        self.block_sel = Some((at, at + n - 1));
+        self.sel = Sel::caret(at, 0);
+        self.scroll_pending = true;
+        window.focus(&self.focus);
+        self.after_edit(cx);
+        true
+    }
+
     /// Selected blocks (with their children) as Markdown.
     fn selected_blocks_markdown(&self) -> Option<String> {
         let r = expand_to_subtrees(&self.blocks, self.block_sel_range()?);
@@ -2079,6 +2165,13 @@ impl Editor {
             self.drop_files(&[path], window, cx);
             return;
         }
+        self.insert_markdown(text, from_nota, cx);
+    }
+
+    /// Insert pasted (or AI-written) text at the caret, replacing the selection.
+    /// `structured` text is Markdown from Nota; anything else is plain text.
+    fn insert_markdown(&mut self, text: String, structured: bool, cx: &mut Context<Self>) {
+        let from_nota = structured;
         let text = text.replace("\r\n", "\n");
         if text.is_empty() {
             return;

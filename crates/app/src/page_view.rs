@@ -17,6 +17,7 @@ use nota_core::{PropKind, PropValue};
 
 pub enum PageEvent {
     Open(String),
+    AskAi,
 }
 
 pub struct PageView {
@@ -112,6 +113,7 @@ impl PageView {
                     this.title.update(cx, |t, cx| t.move_to_end(cx));
                     this.title.read(cx).focus(window);
                 }
+                EditorEvent::AskAi => cx.emit(PageEvent::AskAi),
             }));
             editor = Some(ed);
         }

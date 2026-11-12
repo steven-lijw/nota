@@ -240,6 +240,12 @@ impl Editor {
                     window.handle_input(&focus, ElementInputHandler::new(bounds, entity), cx);
                 });
         }
+        // Keep showing the selection while focus is elsewhere (e.g. the AI panel).
+        let idle_sel = !focused && self.block_sel.is_none() && self.sel.block == ix && !self.sel.range.is_empty();
+        if idle_sel {
+            let dim = Hsla { a: t.selection.a * 0.6, ..t.selection };
+            text_view = text_view.selection(Some(self.sel.range.clone()), dim);
+        }
         if let Some(ph) = placeholder_for(&block.kind, is_cursor_block) {
             let mut f = font(ui_font());
             if matches!(block.kind, BlockKind::Heading(_)) {
@@ -815,6 +821,24 @@ impl Editor {
                     .child(icon(name, 16., if active { t.accent } else { t.text })),
             );
         }
+        let hover = t.hover;
+        bar = bar.child(div().w(px(1.)).h(px(18.)).mx(px(3.)).bg(t.border)).child(
+            div()
+                .id("fmt-ai")
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .h(px(28.))
+                .px(px(8.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .hover(move |s| s.bg(hover))
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(EditorEvent::AskAi)))
+                .child(icon("sparkles", 15., t.accent))
+                .child("Ask AI"),
+        );
         Some(
             deferred(
                 anchored()

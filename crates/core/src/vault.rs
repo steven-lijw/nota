@@ -253,6 +253,12 @@ pub struct AppState {
     pub sidebar_collapsed: bool,
     #[serde(default)]
     pub ai_allow_edits: bool,
+    /// `--model` for Nota AI (`None`: Claude Code's default).
+    #[serde(default)]
+    pub ai_model: Option<String>,
+    /// `--effort` for Nota AI (`None`: Claude Code's default).
+    #[serde(default)]
+    pub ai_effort: Option<String>,
 }
 
 /// Where to put a page among its siblings.

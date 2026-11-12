@@ -80,6 +80,8 @@ pub struct Workspace {
     /// Recently shown pages, kept alive so going back restores scroll and undo.
     recent: Vec<(String, Entity<PageView>)>,
     _page_sub: Option<Subscription>,
+    /// Follows the open editor's selection for the AI panel.
+    _editor_obs: Option<Subscription>,
     _subs: Vec<Subscription>,
 }
 
@@ -107,6 +109,18 @@ impl Workspace {
                         editor.update(cx, |e, cx| e.append_blocks(blocks, cx));
                     }
                 }
+                AiEvent::InsertBelow(md, target) | AiEvent::Replace(md, target) => {
+                    let replace = matches!(ev, AiEvent::Replace(..));
+                    if let Some(editor) = this.page.as_ref().and_then(|p| p.read(cx).editor.clone()) {
+                        let ok = editor.update(cx, |e, cx| e.apply_ai(md, target, replace, window, cx));
+                        if !ok {
+                            this.store.update(cx, |s, cx| {
+                                s.last_error = Some("That part of the page has changed — the answer was not inserted.".into());
+                                cx.notify();
+                            });
+                        }
+                    }
+                }
                 AiEvent::Close => this.toggle_ai(window, cx),
             }),
         ];
@@ -123,6 +137,7 @@ impl Workspace {
             side_drop: None,
             recent: Vec::new(),
             _page_sub: None,
+            _editor_obs: None,
             _subs: subs,
         };
         let start = {
@@ -162,8 +177,10 @@ impl Workspace {
                 self.recent.remove(0);
             }
             self._page_sub = Some(cx.subscribe_in(&view, window, |this: &mut Self, _, ev: &PageEvent, window, cx| {
-                let PageEvent::Open(id) = ev;
-                this.open(id.clone(), window, cx)
+                match ev {
+                    PageEvent::Open(id) => this.open(id.clone(), window, cx),
+                    PageEvent::AskAi => this.ask_ai(window, cx),
+                }
             }));
             self.page = Some(view);
             self.store.update(cx, |s, _| {
@@ -178,6 +195,14 @@ impl Workspace {
             });
         }
         self.ai.update(cx, |ai, cx| ai.set_context(id, cx));
+        self._editor_obs = None;
+        if let Some(editor) = self.page.as_ref().and_then(|p| p.read(cx).editor.clone()) {
+            let ai = self.ai.clone();
+            self._editor_obs = Some(cx.observe(&editor, move |_, editor, cx| {
+                let sel = editor.read(cx).ai_selection();
+                ai.update(cx, |ai, cx| ai.set_selection(sel, cx));
+            }));
+        }
         cx.notify();
     }
 
@@ -300,6 +325,15 @@ impl Workspace {
             s.save_state();
             cx.notify();
         });
+    }
+
+    /// Open the AI panel (if needed) and put the caret in its prompt.
+    fn ask_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.store.read(cx).state.ai_open {
+            self.toggle_ai(window, cx);
+        } else {
+            self.ai.read(cx).focus_input(window, cx);
+        }
     }
 
     fn toggle_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
