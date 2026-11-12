@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   dmg:
     runs-on: macos-latest   # Apple Silicon
@@ -25,3 +28,13 @@ jobs:
         with:
           name: Nota-macos-arm64
           path: dist/Nota-macos-arm64.dmg
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Nota-macos-arm64.dmg
+          body: |
+            Nota for macOS (Apple Silicon).
+
+            The app is not notarized. After dragging it into Applications, open it once with right-click → Open,
+            or run: `xattr -dr com.apple.quarantine /Applications/Nota.app`
