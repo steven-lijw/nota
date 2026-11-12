@@ -11,7 +11,7 @@ use crate::theme::{theme, Theme, AI_PANEL_W, SIDEBAR_W, TOPBAR_H};
 use crate::ui::*;
 use crate::update::{current_version, UpdateStatus, Updater};
 use gpui::{
-    deferred, div, prelude::*, px, AnyElement, ClipboardItem, Context, Corner, DragMoveEvent, Entity, FontWeight,
+    deferred, div, Hsla, prelude::*, px, AnyElement, ClipboardItem, Context, Corner, DragMoveEvent, Entity, FontWeight,
     MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString, Subscription, Window,
 };
 use nota_core::markdown::{from_markdown, to_markdown};
@@ -26,6 +26,24 @@ enum Menu {
     Trash,
     Settings,
     More,
+}
+
+/// Dragging the edge of the sidebar or the AI panel.
+#[derive(Clone, Copy, PartialEq)]
+enum Panel {
+    Sidebar,
+    Ai,
+}
+
+#[derive(Clone)]
+struct ResizePanel(Panel);
+
+struct NoPreview;
+
+impl Render for NoPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
 }
 
 /// Where a page dragged in the sidebar would go, relative to the row under the pointer.
@@ -81,6 +99,11 @@ pub struct Workspace {
     /// Recently shown pages, kept alive so going back restores scroll and undo.
     recent: Vec<(String, Entity<PageView>)>,
     updater: Entity<Updater>,
+    /// A database row shown beside the page.
+    peek: Option<Entity<PageView>>,
+    _peek_sub: Option<Subscription>,
+    /// (panel, pointer x and width when the resize started)
+    resizing: Option<(Panel, Pixels, f32)>,
     _page_sub: Option<Subscription>,
     /// Follows the open editor's selection for the AI panel.
     _editor_obs: Option<Subscription>,
@@ -140,6 +163,9 @@ impl Workspace {
             side_drop: None,
             recent: Vec::new(),
             updater,
+            peek: None,
+            _peek_sub: None,
+            resizing: None,
             _page_sub: None,
             _editor_obs: None,
             _subs: subs,
@@ -181,10 +207,7 @@ impl Workspace {
                 self.recent.remove(0);
             }
             self._page_sub = Some(cx.subscribe_in(&view, window, |this: &mut Self, _, ev: &PageEvent, window, cx| {
-                match ev {
-                    PageEvent::Open(id) => this.open(id.clone(), window, cx),
-                    PageEvent::AskAi => this.ask_ai(window, cx),
-                }
+                this.on_page_event(ev, window, cx)
             }));
             self.page = Some(view);
             self.store.update(cx, |s, _| {
@@ -198,16 +221,67 @@ impl Workspace {
                 s.save_state();
             });
         }
+        let _ = id;
+        self.peek = None;
+        self._peek_sub = None;
+        self.follow_for_ai(cx);
+        cx.notify();
+    }
+
+    fn on_page_event(&mut self, ev: &PageEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev {
+            PageEvent::Open(id) => self.open(id.clone(), window, cx),
+            PageEvent::Peek(id) => self.peek(id.clone(), window, cx),
+            PageEvent::AskAi => self.ask_ai(window, cx),
+        }
+    }
+
+    /// Show a page (normally a database row) in the panel on the right.
+    fn peek(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.peek.as_ref().is_some_and(|p| p.read(cx).page_id == id) {
+            return;
+        }
+        if self.store.read(cx).page(&id).is_none() {
+            return;
+        }
+        let store = self.store.clone();
+        let view = cx.new(|cx| PageView::new(store, id, window, cx));
+        self._peek_sub = Some(cx.subscribe_in(&view, window, |this: &mut Self, _, ev: &PageEvent, window, cx| {
+            match ev {
+                // following a link from the peek opens it as the main page
+                PageEvent::Open(id) => {
+                    this.close_peek(cx);
+                    this.open(id.clone(), window, cx)
+                }
+                other => this.on_page_event(other, window, cx),
+            }
+        }));
+        self.peek = Some(view);
+        self.follow_for_ai(cx);
+        cx.notify();
+    }
+
+    fn close_peek(&mut self, cx: &mut Context<Self>) {
+        if self.peek.take().is_some() {
+            self._peek_sub = None;
+            self.follow_for_ai(cx);
+            cx.notify();
+        }
+    }
+
+    /// Point the AI panel at the page in front: the peek if open, else the main page.
+    fn follow_for_ai(&mut self, cx: &mut Context<Self>) {
+        let front = self.peek.clone().or_else(|| self.page.clone());
+        let id = front.as_ref().map(|p| p.read(cx).page_id.clone());
         self.ai.update(cx, |ai, cx| ai.set_context(id, cx));
         self._editor_obs = None;
-        if let Some(editor) = self.page.as_ref().and_then(|p| p.read(cx).editor.clone()) {
+        if let Some(editor) = front.and_then(|p| p.read(cx).editor.clone()) {
             let ai = self.ai.clone();
             self._editor_obs = Some(cx.observe(&editor, move |_, editor, cx| {
                 let sel = editor.read(cx).ai_selection();
                 ai.update(cx, |ai, cx| ai.set_selection(sel, cx));
             }));
         }
-        cx.notify();
     }
 
     pub fn open(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -509,6 +583,52 @@ impl Workspace {
         cx.notify();
     }
 
+    fn sidebar_width(&self, s: &Store) -> f32 {
+        s.state.sidebar_width.unwrap_or(SIDEBAR_W)
+    }
+
+    fn ai_width(&self, s: &Store) -> f32 {
+        s.state.ai_width.unwrap_or(AI_PANEL_W)
+    }
+
+    /// A thin strip on a panel edge that can be dragged to resize it.
+    fn resize_handle(&self, panel: Panel, width: f32, t: &Theme, cx: &Context<Self>) -> AnyElement {
+        let accent = t.accent;
+        let mut h = div()
+            .id(if panel == Panel::Sidebar { "resize-sidebar" } else { "resize-ai" })
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .w(px(6.))
+            .cursor_col_resize()
+            .hover(move |s| s.bg(Hsla { a: 0.35, ..accent }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.resizing = Some((panel, ev.position.x, width));
+                }),
+            )
+            .on_drag(ResizePanel(panel), |_, _, _, cx| cx.new(|_| NoPreview));
+        h = if panel == Panel::Sidebar { h.right(px(-3.)) } else { h.left(px(-3.)) };
+        if self.resizing.is_some_and(|r| r.0 == panel) {
+            h = h.bg(Hsla { a: 0.5, ..accent });
+        }
+        h.into_any_element()
+    }
+
+    fn resize_moved(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some((panel, start_x, start_w)) = self.resizing else { return };
+        let dx = (x - start_x) / px(1.);
+        self.store.update(cx, |s, cx| {
+            match panel {
+                Panel::Sidebar => s.state.sidebar_width = Some((start_w + dx).clamp(180., 480.).round()),
+                Panel::Ai => s.state.ai_width = Some((start_w - dx).clamp(300., 760.).round()),
+            }
+            cx.notify();
+        });
+    }
+
     // --- sidebar -------------------------------------------------------------
 
     fn side_item(&self, id: &'static str, icon_name: &str, label: &'static str, t: &Theme) -> gpui::Stateful<gpui::Div> {
@@ -764,7 +884,8 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(SIDEBAR_W))
+            .relative()
+            .w(px(self.sidebar_width(s)))
             .h_full()
             .bg(t.sidebar_bg)
             .border_r_1()
@@ -843,6 +964,7 @@ impl Workspace {
         if let Some(bar) = self.render_update_bar(t, cx) {
             col = col.child(bar);
         }
+        col = col.child(self.resize_handle(Panel::Sidebar, self.sidebar_width(s), t, cx));
         col.into_any_element()
     }
 
@@ -1319,6 +1441,9 @@ impl Render for Workspace {
         if !cx.has_active_drag() && self.side_drop.is_some() {
             self.side_drop = None;
         }
+        if !cx.has_active_drag() && self.resizing.take().is_some() {
+            self.store.read(cx).save_state(); // remember the new width
+        }
         let store = self.store.clone();
         let cx: &Context<Self> = cx;
         let s = store.read(cx);
@@ -1362,21 +1487,59 @@ impl Render for Workspace {
                 this.menu = Some((Menu::Settings, gpui::point(px(250.), px(420.))));
                 cx.notify();
             }))
+            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<ResizePanel>, _, cx| {
+                this.resize_moved(ev.event.position.x, cx)
+            }))
             .on_action(cx.listener(|this, _: &GoBack, window, cx| this.go_back(window, cx)))
             .on_action(cx.listener(|this, _: &GoForward, window, cx| this.go_forward(window, cx)));
         if !s.state.sidebar_collapsed {
             root = root.child(self.render_sidebar(s, &t, cx));
         }
         root = root.child(main);
-        if s.state.ai_open {
+        if let Some(peek) = &self.peek {
+            let id = peek.read(cx).page_id.clone();
+            let header = div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(2.))
+                .h(px(TOPBAR_H))
+                .px(px(8.))
+                .child(icon_button("peek-close", "chevrons-right", &t).on_click(cx.listener(|this, _, _, cx| this.close_peek(cx))))
+                .child(icon_button("peek-full", "arrow-up-right", &t).on_click(cx.listener(move |this, _, window, cx| {
+                    this.close_peek(cx);
+                    this.open(id.clone(), window, cx)
+                })))
+                .child(div().flex_1())
+                .child(div().text_size(px(12.)).text_color(t.text_faint).pr(px(6.)).child("Peek"));
             root = root.child(
                 div()
+                    .flex()
+                    .flex_col()
                     .flex_none()
-                    .w(px(AI_PANEL_W))
+                    .w(px(620.))
+                    .max_w(gpui::relative(0.5))
+                    .h_full()
+                    .bg(t.bg)
+                    .border_l_1()
+                    .border_color(t.border)
+                    .shadow(popover_shadow(&t))
+                    .child(header)
+                    .child(div().flex_1().min_h_0().child(peek.clone())),
+            );
+        }
+        if s.state.ai_open {
+            let w = self.ai_width(s);
+            root = root.child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .w(px(w))
                     .h_full()
                     .border_l_1()
                     .border_color(t.border)
-                    .child(self.ai.clone()),
+                    .child(self.ai.clone())
+                    .child(self.resize_handle(Panel::Ai, w, &t, cx)),
             );
         }
         if let Some(err) = &s.last_error {
@@ -1385,7 +1548,7 @@ impl Render for Workspace {
                     .id("error-toast")
                     .absolute()
                     .bottom(px(16.))
-                    .left(px(SIDEBAR_W + 16.))
+                    .left(px(if s.state.sidebar_collapsed { 16. } else { self.sidebar_width(s) + 16. }))
                     .px(px(12.))
                     .py(px(8.))
                     .rounded(px(8.))

@@ -17,6 +17,8 @@ use nota_core::{PropKind, PropValue};
 
 pub enum PageEvent {
     Open(String),
+    /// Show a database row in the side peek.
+    Peek(String),
     AskAi,
 }
 
@@ -96,8 +98,10 @@ impl PageView {
         if is_db {
             let view = cx.new(|cx| DatabaseView::new(store.clone(), page_id.clone(), window, cx));
             subs.push(cx.subscribe(&view, |_, _, ev: &DbEvent, cx| {
-                let DbEvent::Open(id) = ev;
-                cx.emit(PageEvent::Open(id.clone()))
+                match ev {
+                    DbEvent::Open(id) => cx.emit(PageEvent::Open(id.clone())),
+                    DbEvent::Peek(id) => cx.emit(PageEvent::Peek(id.clone())),
+                }
             }));
             db = Some(view);
         } else {

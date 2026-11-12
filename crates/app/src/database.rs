@@ -21,7 +21,10 @@ use nota_core::{
 };
 
 pub enum DbEvent {
+    /// Open the row as a full page.
     Open(String),
+    /// Show the row in the side peek.
+    Peek(String),
 }
 
 #[derive(Clone, PartialEq)]
@@ -89,6 +92,18 @@ impl Render for DragCard {
     }
 }
 
+/// Dragging the right edge of a table column header.
+#[derive(Clone)]
+struct ResizeCol(String);
+
+struct NoPreview;
+
+impl Render for NoPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
 /// Board drop indicator: before card `index` of column `group`.
 #[derive(Clone, Copy, PartialEq)]
 struct BoardDrop {
@@ -131,6 +146,10 @@ pub struct DatabaseView {
     /// Window bounds of board cards, by row id.
     card_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     board_drop: Option<BoardDrop>,
+    /// Table / list: insert position among the shown rows.
+    row_drop: Option<usize>,
+    /// (column, pointer x and width when the resize started)
+    col_resize: Option<(String, Pixels, f32)>,
     dragging: Option<String>,
     _subs: Vec<Subscription>,
     _cell_sub: Option<Subscription>,
@@ -156,6 +175,8 @@ impl DatabaseView {
             month: (d.year(), d.month()),
             card_bounds: Rc::new(RefCell::new(HashMap::new())),
             board_drop: None,
+            row_drop: None,
+            col_resize: None,
             dragging: None,
             _subs: subs,
             _cell_sub: None,
@@ -456,7 +477,7 @@ impl DatabaseView {
             .child(primary_button("db-new", "New", t).on_click(cx.listener(
                 |this, _, _, cx| {
                     let id = this.add_row(None, cx);
-                    cx.emit(DbEvent::Open(id));
+                    cx.emit(DbEvent::Peek(id));
                 },
             )))
             .into_any_element()
@@ -472,9 +493,32 @@ impl DatabaseView {
         let mut header = div().flex().h(px(34.)).border_b_1().border_color(t.border);
         for (i, p) in cols.iter().enumerate() {
             let name = p.name.clone();
+            let (rname, w) = (p.name.clone(), col_width(view, p));
+            let accent = t.accent;
+            let resizing = self.col_resize.as_ref().is_some_and(|r| r.0 == p.name);
+            let grip = div()
+                .id(("th-resize", i))
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right(px(-3.))
+                .w(px(6.))
+                .cursor_col_resize()
+                .when(resizing, |d| d.bg(Hsla { a: 0.5, ..accent }))
+                .hover(move |s| s.bg(Hsla { a: 0.35, ..accent }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.col_resize = Some((rname.clone(), ev.position.x, w));
+                    }),
+                )
+                .on_drag(ResizeCol(p.name.clone()), |_, _, _, cx| cx.new(|_| NoPreview));
             header = header.child(
                 div()
                     .id(("th", i))
+                    .relative()
+                    .child(grip)
                     .flex()
                     .flex_none()
                     .items_center()
@@ -515,17 +559,53 @@ impl DatabaseView {
                 .child(icon("plus", 16., t.text_faint)),
         );
 
-        let mut body = div().flex().flex_col().w(px(total)).child(header);
-        for row in rows {
+        let manual = view.sorts.is_empty();
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .w(px(total))
+            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<ResizeCol>, _, cx| {
+                let Some((name, start_x, start_w)) = this.col_resize.clone() else { return };
+                let w = (start_w + (ev.event.position.x - start_x) / px(1.)).clamp(70., 900.).round();
+                if ev.drag(cx).0 == name {
+                    this.update_view(cx, |v| {
+                        v.widths.insert(name, w);
+                    });
+                }
+            }))
+            .on_drag_move(cx.listener({
+                let ids = ids.clone();
+                move |this, ev: &DragMoveEvent<DragRow>, _, cx| this.row_drag_moved(ev, &ids, manual, cx)
+            }))
+            .on_drop(cx.listener({
+                let ids = ids.clone();
+                move |this, drag: &DragRow, _, cx| this.drop_row(drag, &ids, cx)
+            }))
+            .child(header);
+        let n_rows = rows.len();
+        for (ri, row) in rows.iter().enumerate() {
             let group: SharedString = format!("tr-{}", row.id).into();
             let rid = row.id.clone();
-            let mut tr = div()
-                .id(eid("tr", &row.id))
+            let bounds = self.card_bounds.clone();
+            let bid = row.id.clone();
+            let mut tr = self
+                .drag_source(div().id(eid("tr", &row.id)), row, None, None)
                 .group(group.clone())
+                .relative()
                 .flex()
                 .min_h(px(34.))
                 .border_b_1()
                 .border_color(t.border)
+                .child(
+                    canvas(move |b, _, _| {
+                        bounds.borrow_mut().insert(bid, b);
+                    }, |_, _, _, _| {})
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                )
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
@@ -599,6 +679,14 @@ impl DatabaseView {
                 }
                 tr = tr.child(td);
             }
+            if let Some(at) = self.row_drop {
+                let line = div().absolute().left_0().right_0().h(px(2.)).bg(t.accent);
+                if at == ri {
+                    tr = tr.child(line.top(px(-1.)));
+                } else if at == n_rows && ri + 1 == n_rows {
+                    tr = tr.child(line.bottom(px(-1.)));
+                }
+            }
             body = body.child(tr);
         }
         body = body
@@ -664,6 +752,31 @@ impl DatabaseView {
             )
     }
 
+    /// Make `el` drag the given row (dimmed while it is being dragged).
+    fn drag_source(
+        &self,
+        el: gpui::Stateful<gpui::Div>,
+        row: &Page,
+        width: Option<f32>,
+        from: Option<String>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let dragged = self.dragging.as_deref() == Some(row.id.as_str());
+        el.when(dragged, |d| d.opacity(0.4)).on_drag(
+            DragRow {
+                id: row.id.clone(),
+                title: row.display_title().to_string(),
+                icon: row.icon.clone(),
+                width,
+                from,
+            },
+            |drag: &DragRow, grab, _, cx| {
+                let (title, icon, width) = (drag.title.clone().into(), drag.icon.clone(), drag.width);
+                cx.new(|_| DragCard { title, icon, width, grab })
+            },
+        )
+    }
+
+    /// A card (or list row) that opens on click and can be dragged.
     fn draggable_card(
         &self,
         row: &Page,
@@ -675,32 +788,65 @@ impl DatabaseView {
         let rid = row.id.clone();
         let rid2 = row.id.clone();
         let hover = t.hover;
-        let dragged = self.dragging.as_deref() == Some(row.id.as_str());
-        div()
+        let el = div()
             .id(eid("card", &row.id))
             .cursor_pointer()
-            .when(dragged, |d| d.opacity(0.4))
             .hover(move |s| s.bg(hover))
-            .on_click(cx.listener(move |_, _, _, cx| cx.emit(DbEvent::Open(rid.clone()))))
+            .on_click(cx.listener(move |_, _, _, cx| cx.emit(DbEvent::Peek(rid.clone()))))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                     this.open_popup(Popup::RowMenu(rid2.clone()), ev.position, window, cx)
                 }),
+            );
+        self.drag_source(el, row, width, from)
+    }
+
+    /// A row is dragged over a table or list: work out the insert position.
+    fn row_drag_moved(&mut self, ev: &DragMoveEvent<DragRow>, ids: &[String], manual: bool, cx: &mut Context<Self>) {
+        let pos = ev.event.position;
+        let dragged = ev.drag(cx).id.clone();
+        if self.dragging.as_ref() != Some(&dragged) {
+            self.dragging = Some(dragged.clone());
+            cx.notify();
+        }
+        let at = if manual && ev.bounds.contains(&pos) {
+            let bounds = self.card_bounds.borrow();
+            Some(
+                ids.iter()
+                    .position(|id| bounds.get(id).is_some_and(|b| pos.y < b.center().y))
+                    .unwrap_or(ids.len()),
             )
-            .on_drag(
-                DragRow {
-                    id: row.id.clone(),
-                    title: row.display_title().to_string(),
-                    icon: row.icon.clone(),
-                    width,
-                    from,
-                },
-                |drag: &DragRow, grab, _, cx| {
-                    let (title, icon, width) = (drag.title.clone().into(), drag.icon.clone(), drag.width);
-                    cx.new(|_| DragCard { title, icon, width, grab })
-                },
-            )
+        } else {
+            None
+        };
+        // dropping right next to itself changes nothing
+        let at = at.filter(|&i| {
+            let me = ids.iter().position(|id| *id == dragged);
+            me.is_none_or(|m| i != m && i != m + 1)
+        });
+        if self.row_drop != at {
+            self.row_drop = at;
+            cx.notify();
+        }
+    }
+
+    fn drop_row(&mut self, drag: &DragRow, ids: &[String], cx: &mut Context<Self>) {
+        self.dragging = None;
+        let Some(at) = self.row_drop.take() else {
+            cx.notify();
+            return;
+        };
+        let anchor = match ids.get(at) {
+            Some(next) => Anchor::Before(next.clone()),
+            None => match ids.last() {
+                Some(last) => Anchor::After(last.clone()),
+                None => return,
+            },
+        };
+        let (row, db) = (drag.id.clone(), self.db_id.clone());
+        self.store.update(cx, |s, cx| s.place_page(&row, Some(db), anchor, cx));
+        cx.notify();
     }
 
     fn render_board(&self, db: &Database, view: &View, rows: &[&Page], t: &Theme, cx: &Context<Self>) -> AnyElement {
@@ -900,14 +1046,50 @@ impl DatabaseView {
     }
 
     fn render_list(&self, db: &Database, view: &View, rows: &[&Page], t: &Theme, cx: &Context<Self>) -> AnyElement {
-        let mut list = div().flex().flex_col().pt(px(6.));
-        for row in rows {
+        let manual = view.sorts.is_empty();
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .pt(px(6.))
+            .on_drag_move(cx.listener({
+                let ids = ids.clone();
+                move |this, ev: &DragMoveEvent<DragRow>, _, cx| this.row_drag_moved(ev, &ids, manual, cx)
+            }))
+            .on_drop(cx.listener({
+                let ids = ids.clone();
+                move |this, drag: &DragRow, _, cx| this.drop_row(drag, &ids, cx)
+            }));
+        let n_rows = rows.len();
+        for (ri, row) in rows.iter().enumerate() {
             let mut right = div().flex().flex_none().items_center().gap(px(10.)).text_size(px(12.)).text_color(t.text_muted);
             for p in self.card_props(db, view, row, None, t) {
                 right = right.child(p);
             }
+            let bounds = self.card_bounds.clone();
+            let bid = row.id.clone();
+            let mut line = None;
+            if let Some(at) = self.row_drop {
+                let l = div().absolute().left_0().right_0().h(px(2.)).bg(t.accent);
+                if at == ri {
+                    line = Some(l.top(px(-1.)));
+                } else if at == n_rows && ri + 1 == n_rows {
+                    line = Some(l.bottom(px(-1.)));
+                }
+            }
             list = list.child(
                 self.draggable_card(row, None, None, t, cx)
+                    .relative()
+                    .child(
+                        canvas(move |b, _, _| {
+                            bounds.borrow_mut().insert(bid, b);
+                        }, |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                    )
+                    .children(line)
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -1003,7 +1185,7 @@ impl DatabaseView {
                 .hover(move |s| s.bg(hover))
                 .on_click(cx.listener(|this, _, _, cx| {
                     let id = this.add_row(None, cx);
-                    cx.emit(DbEvent::Open(id));
+                    cx.emit(DbEvent::Peek(id));
                 }))
                 .child(icon("plus", 16., t.text_faint))
                 .child("New page"),
@@ -1701,9 +1883,11 @@ fn short_op(op: FilterOp) -> &'static str {
 impl Render for DatabaseView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
-        if !cx.has_active_drag() && (self.dragging.is_some() || self.board_drop.is_some()) {
+        if !cx.has_active_drag() {
             self.dragging = None;
             self.board_drop = None;
+            self.row_drop = None;
+            self.col_resize = None;
         }
         let active = self.view_ix(cx);
         let store = self.store.clone();

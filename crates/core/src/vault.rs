@@ -259,6 +259,11 @@ pub struct AppState {
     /// `--effort` for Nota AI (`None`: Claude Code's default).
     #[serde(default)]
     pub ai_effort: Option<String>,
+    /// Widths the sidebar and the AI panel were dragged to.
+    #[serde(default)]
+    pub sidebar_width: Option<f32>,
+    #[serde(default)]
+    pub ai_width: Option<f32>,
 }
 
 /// Where to put a page among its siblings.
