@@ -10,7 +10,7 @@ use gpui::{
     Point, SharedString, Subscription, Window,
 };
 use nota_core::query::{add_months, date_to_string, format_date, month_grid, month_name, parse_date, today};
-use nota_core::{format_number, Page, PropKind, PropValue, Property};
+use nota_core::{format_number, Page, PropKind, PropValue, Property, OPTION_COLORS};
 
 pub fn eid(prefix: &str, key: &str) -> ElementId {
     ElementId::Name(format!("{prefix}-{key}").into())
@@ -95,6 +95,9 @@ pub struct CellEditor {
     pub input: Entity<TextInput>,
     pub pos: Point<Pixels>,
     month: (i32, u32),
+    /// The option whose settings (name, colour, delete) are open.
+    editing_option: Option<String>,
+    option_name: Entity<TextInput>,
     _subs: Vec<Subscription>,
 }
 
@@ -144,6 +147,7 @@ impl CellEditor {
             i
         });
         input.read(cx).focus(window);
+        let option_name = cx.new(|cx| TextInput::new(window, cx));
         let subs = vec![cx.subscribe(&input, |this: &mut Self, _, ev: &InputEvent, cx| match ev {
             InputEvent::Submit => {
                 this.submit(cx);
@@ -156,8 +160,117 @@ impl CellEditor {
                 cx.notify();
             }
             _ => {}
+        }),
+        cx.subscribe_in(&option_name, window, |this: &mut Self, _, ev: &InputEvent, window, cx| match ev {
+            InputEvent::Submit | InputEvent::Cancel => this.close_option(window, cx),
+            _ => {}
         })];
-        CellEditor { store, db_id, row_id, prop, kind, input, pos, month, _subs: subs }
+        CellEditor {
+            store,
+            db_id,
+            row_id,
+            prop,
+            kind,
+            input,
+            pos,
+            month,
+            editing_option: None,
+            option_name,
+            _subs: subs,
+        }
+    }
+
+    fn open_option(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.option_name.update(cx, |i, cx| {
+            i.set_text(name.clone(), cx);
+            i.select_all_text(cx);
+        });
+        self.option_name.read(cx).focus(window);
+        self.editing_option = Some(name);
+        cx.notify();
+    }
+
+    /// Leave the option settings, applying a rename.
+    fn close_option(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(old) = self.editing_option.take() {
+            let new = self.option_name.read(cx).text().trim().to_string();
+            let (db, prop) = (self.db_id.clone(), self.prop.clone());
+            self.store.update(cx, |s, cx| {
+                let touched = s.vault.rename_option(&db, &prop, &old, &new);
+                s.mark_many(&touched, cx);
+            });
+        }
+        self.input.read(cx).focus(window);
+        cx.notify();
+    }
+
+    fn set_option_color(&mut self, name: &str, color: &str, cx: &mut Context<Self>) {
+        let (db, prop, name, color) = (self.db_id.clone(), self.prop.clone(), name.to_string(), color.to_string());
+        self.store.update(cx, |s, cx| {
+            s.update_page(&db, cx, |p| {
+                if let Some(o) = p
+                    .database
+                    .as_mut()
+                    .and_then(|d| d.prop_mut(&prop))
+                    .and_then(|pr| pr.options.iter_mut().find(|o| o.name == name))
+                {
+                    o.color = color;
+                }
+            })
+        });
+        cx.notify();
+    }
+
+    fn delete_option(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (db, prop, name) = (self.db_id.clone(), self.prop.clone(), name.to_string());
+        self.store.update(cx, |s, cx| {
+            let touched = s.vault.delete_option(&db, &prop, &name);
+            s.mark_many(&touched, cx);
+        });
+        self.editing_option = None;
+        self.input.read(cx).focus(window);
+        cx.notify();
+    }
+
+    fn render_option_settings(&self, name: &str, t: &Theme, cx: &Context<Self>) -> gpui::Div {
+        let color = self.property(cx).map(|p| p.option_color(name).to_string()).unwrap_or_default();
+        let field = div()
+            .mx(px(8.))
+            .my(px(6.))
+            .px(px(8.))
+            .py(px(5.))
+            .rounded(px(6.))
+            .bg(t.hover)
+            .border_1()
+            .border_color(t.border)
+            .child(self.option_name.clone());
+        let n = name.to_string();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .child(
+                menu_item("opt-back", Some("chevron-left"), "Back", t)
+                    .on_click(cx.listener(|this, _, window, cx| this.close_option(window, cx))),
+            )
+            .child(field)
+            .child(
+                menu_item("opt-del", Some("trash"), "Delete", t)
+                    .on_click(cx.listener(move |this, _, window, cx| this.delete_option(&n, window, cx))),
+            )
+            .child(menu_separator(t))
+            .child(menu_label("Colors", t));
+        for (i, c) in OPTION_COLORS.iter().enumerate() {
+            let (bg, _) = t.tag(c);
+            let n = name.to_string();
+            let mut item = menu_item(("opt-color", i), None, capitalize(c), t)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_option_color(&n, c, cx)));
+            item = item.child(div().size(px(16.)).rounded(px(4.)).bg(bg).border_1().border_color(t.border));
+            if *c == color {
+                item = item.child(icon("check", 14., t.text_muted));
+            }
+            col = col.child(item);
+        }
+        col.pb(px(4.))
     }
 
     fn property(&self, cx: &Context<Self>) -> Option<Property> {
@@ -388,6 +501,10 @@ impl Render for CellEditor {
                             .on_click(cx.listener(|this, _, _, cx| this.set_date(None, cx))),
                     );
             }
+            k if k.has_options() && self.editing_option.is_some() => {
+                let name = self.editing_option.clone().unwrap_or_default();
+                surface = surface.child(self.render_option_settings(&name, &t, cx));
+            }
             k if k.has_options() => {
                 let prop = self.property(cx);
                 let selected = self.selected(cx);
@@ -409,10 +526,14 @@ impl Render for CellEditor {
                             pill(o.name.clone(), &o.color, &t)
                         };
                         let hover = t.hover;
+                        let group: SharedString = format!("cell-opt-{i}").into();
+                        let edit_name = o.name.clone();
                         let mut row = div()
                             .id(("cell-opt", i))
+                            .group(group.clone())
                             .flex()
                             .items_center()
+                            .gap(px(4.))
                             .h(px(30.))
                             .mx(px(4.))
                             .px(px(8.))
@@ -424,6 +545,15 @@ impl Render for CellEditor {
                         if selected.contains(&o.name) {
                             row = row.child(icon("check", 14., t.text_muted));
                         }
+                        row = row.child(
+                            icon_button(("cell-opt-more", i), "more", &t)
+                                .opacity(0.)
+                                .group_hover(group, |s| s.opacity(1.))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_option(edit_name.clone(), window, cx)
+                                })),
+                        );
                         surface = surface.child(row);
                     }
                 }
@@ -455,4 +585,9 @@ impl Render for CellEditor {
         }
         surface
     }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
 }

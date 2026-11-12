@@ -10,4 +10,4 @@ pub mod vault;
 
 pub use model::*;
 pub use rich_text::{MarkKind, Marks, RichText};
-pub use vault::{Anchor, AppState, SearchHit, Vault};
+pub use vault::{Anchor, AppState, ChangedOnDisk, SearchHit, Vault};

@@ -132,6 +132,29 @@ impl PageView {
         }
     }
 
+    /// Called when a kept-alive view is shown again: pick up anything that
+    /// changed in the store while it was hidden.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        let (title, blocks) = {
+            let s = self.store.read(cx);
+            let p = s.page(&self.page_id);
+            (p.map(|p| p.title.clone()).unwrap_or_default(), p.map(|p| p.blocks.clone()))
+        };
+        self.title.update(cx, |t, cx| {
+            if t.text() != title {
+                t.set_text(title, cx)
+            }
+        });
+        if let (Some(editor), Some(blocks)) = (&self.editor, blocks) {
+            let stale = editor.read(cx).blocks != blocks && !blocks.is_empty();
+            if stale {
+                editor.update(cx, |e, cx| e.reload_blocks(cx));
+            }
+        }
+        self.icon_picker = None;
+        cx.notify();
+    }
+
     fn set_icon(&mut self, icon: Option<String>, cx: &mut Context<Self>) {
         let id = self.page_id.clone();
         self.store.update(cx, |s, cx| s.update_page(&id, cx, |p| p.icon = icon));
@@ -219,6 +242,44 @@ impl Render for PageView {
         };
         let is_db = page.is_database();
         let hover = t.hover;
+
+        // A file Nota could not read is shown as it is, read-only.
+        if let Some(err) = &page.load_error {
+            let file = page.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
+            return div()
+                .id("page-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .child(
+                    div().flex().justify_center().w_full().child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(14.))
+                            .w_full()
+                            .max_w(px(PAGE_MAX_W))
+                            .pt(px(48.))
+                            .pb(px(80.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .p(px(12.))
+                                    .rounded(px(8.))
+                                    .bg(t.callout_bg)
+                                    .text_size(px(14.))
+                                    .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("Nota couldn't read {file}")))
+                                    .child(div().text_color(t.text_muted).child(SharedString::from(err.clone())))
+                                    .child(div().text_color(t.text_muted).child(
+                                        "It is shown read-only and won't be changed. Fix the file in a text editor, then use Settings → Reload from disk.",
+                                    )),
+                            )
+                            .child(crate::blocks_view::static_blocks(&page.blocks, &t, 16.)),
+                    ),
+                )
+                .into_any_element();
+        }
 
         // --- icon + title ---------------------------------------------------
         let mut head = div().group("page-head").flex().flex_col();

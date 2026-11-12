@@ -485,7 +485,7 @@ impl Editor {
         }
         self.checkpoint(EditKind::Typing);
         let ix = self.sel.block;
-        let is_code = matches!(self.blocks[ix].kind, BlockKind::Code { .. });
+        let is_code = self.blocks[ix].kind.is_raw();
         let marks = if is_code {
             Some(Marks::default())
         } else if range.is_empty() {
@@ -776,6 +776,8 @@ impl Editor {
         let Some(range) = self.block_sel_range() else {
             return false;
         };
+        // children go with their parent
+        let range = expand_to_subtrees(&self.blocks, range);
         self.checkpoint(EditKind::Other);
         let indent = self.blocks[range.start].indent;
         self.blocks.drain(range.clone());
@@ -809,7 +811,7 @@ impl Editor {
             if !block.kind.has_text() {
                 continue;
             }
-            if matches!(kind, BlockKind::Code { .. }) {
+            if kind.is_raw() {
                 block.text.clear_marks();
             }
             if kind == BlockKind::Divider {
@@ -1276,7 +1278,7 @@ impl Editor {
 
     fn indent_blocks(&mut self, outdent: bool, cx: &mut Context<Self>) {
         let range = match self.block_sel_range() {
-            Some(r) => r,
+            Some(r) => expand_to_subtrees(&self.blocks, r),
             None => self.sel.block..subtree_end(&self.blocks, self.sel.block),
         };
         if range.start == 0 && !outdent {
@@ -1366,7 +1368,7 @@ impl Editor {
 
     pub(crate) fn toggle_mark(&mut self, kind: MarkKind, cx: &mut Context<Self>) {
         let ix = self.sel.block;
-        if matches!(self.blocks[ix].kind, BlockKind::Code { .. }) || !self.blocks[ix].kind.has_text() {
+        if self.blocks[ix].kind.is_raw() || !self.blocks[ix].kind.has_text() {
             return;
         }
         if self.sel.range.is_empty() {
@@ -1457,7 +1459,7 @@ impl Editor {
         self.checkpoint(EditKind::Other);
         let block = self.blocks.remove(ix);
         let at = self.blocks[prev].text.len();
-        if matches!(self.blocks[prev].kind, BlockKind::Code { .. }) {
+        if self.blocks[prev].kind.is_raw() {
             self.blocks[prev].text.replace(at..at, &block.text.text, Some(Marks::default()));
         } else {
             self.blocks[prev].text.append(&block.text);
@@ -1576,7 +1578,7 @@ impl Editor {
         }
         let ix = self.sel.block;
         let kind = self.blocks[ix].kind.clone();
-        if let BlockKind::Code { .. } = kind {
+        if kind.is_raw() {
             // keep the indentation of the current line
             let caret = self.sel.range.start;
             let text = self.text();
@@ -1661,7 +1663,7 @@ impl Editor {
     }
 
     pub(crate) fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
-        if self.block_sel.is_none() && matches!(self.cur().kind, BlockKind::Code { .. }) {
+        if self.block_sel.is_none() && self.cur().kind.is_raw() {
             let r = self.sel.range.clone();
             self.insert_text(r, "    ", cx);
             return;
@@ -1993,8 +1995,39 @@ impl Editor {
         cx.notify();
     }
 
+    /// Selected blocks (with their children) as Markdown.
+    fn selected_blocks_markdown(&self) -> Option<String> {
+        let r = expand_to_subtrees(&self.blocks, self.block_sel_range()?);
+        let mut blocks: Vec<Block> = self.blocks[r].to_vec();
+        let base = blocks.iter().map(|b| b.indent).min().unwrap_or(0);
+        for b in &mut blocks {
+            b.indent -= base;
+        }
+        Some(to_markdown(&blocks))
+    }
+
+    /// What goes on the clipboard: (plain text, Markdown kept for pasting back into Nota).
+    fn clipboard_contents(&self) -> Option<(String, String)> {
+        if let Some(md) = self.selected_blocks_markdown() {
+            return Some((md.clone(), md));
+        }
+        if self.sel.range.is_empty() {
+            return None;
+        }
+        let r = self.sel.range.clone();
+        let plain = self.text()[r.clone()].to_string();
+        if self.cur().kind.is_raw() {
+            return Some((plain.clone(), plain));
+        }
+        let mut rich = self.cur().text.clone();
+        rich.split_off(r.end);
+        let part = rich.split_off(r.start);
+        Some((plain, nota_core::markdown::inline_to_md(&part)))
+    }
+
     fn selected_markdown(&self) -> Option<String> {
         if let Some(r) = self.block_sel_range() {
+            let r = expand_to_subtrees(&self.blocks, r);
             let mut blocks: Vec<Block> = self.blocks[r].to_vec();
             let base = blocks.iter().map(|b| b.indent).min().unwrap_or(0);
             for b in &mut blocks {
@@ -2009,14 +2042,14 @@ impl Editor {
     }
 
     pub(crate) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.selected_markdown() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if let Some((plain, md)) = self.clipboard_contents() {
+            cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(plain, md));
         }
     }
 
     pub(crate) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.selected_markdown() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if let Some((plain, md)) = self.clipboard_contents() {
+            cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(plain, md));
             self.backspace(&Backspace, window, cx);
         }
     }
@@ -2029,7 +2062,13 @@ impl Editor {
         if text.is_none() && self.paste_image(&item, cx) {
             return;
         }
-        let Some(text) = text else {
+        // Copied from Nota: the Markdown version keeps formatting and structure.
+        let nota_md = item.entries().first().and_then(|e| match e {
+            gpui::ClipboardEntry::String(s) => s.metadata_json::<String>(),
+            _ => None,
+        });
+        let from_nota = nota_md.is_some();
+        let Some(text) = nota_md.or(text) else {
             return;
         };
         // a copied image file (path or file:// URL)
@@ -2049,7 +2088,7 @@ impl Editor {
         if !self.blocks[ix].kind.has_text() {
             return;
         }
-        let is_code = matches!(self.blocks[ix].kind, BlockKind::Code { .. });
+        let is_code = self.blocks[ix].kind.is_raw();
         if is_code {
             let r = self.sel.range.clone();
             self.insert_text(r, &text, cx);
@@ -2082,31 +2121,52 @@ impl Editor {
             self.after_edit(cx);
             return;
         }
-        let mut pasted = from_markdown(&text);
+        let source = if from_nota { text.clone() } else { lines_as_blocks(&text) };
+        let mut pasted = from_markdown(&source);
         if pasted.is_empty() {
             return;
         }
         self.checkpoint(EditKind::Other);
+        // the pasted blocks replace the selected text
+        let r = self.sel.range.clone();
+        if !r.is_empty() {
+            self.blocks[ix].text.replace(r.clone(), "", None);
+        }
+        let caret = r.start;
         let indent = self.blocks[ix].indent;
         for b in &mut pasted {
             b.indent = b.indent.saturating_add(indent);
         }
-        let n = pasted.len();
-        let at = if self.blocks[ix].kind == BlockKind::Paragraph && self.blocks[ix].text.is_empty() {
-            self.blocks.remove(ix);
-            ix
-        } else {
-            subtree_end(&self.blocks, ix)
-        };
-        for (i, b) in pasted.into_iter().enumerate() {
-            self.blocks.insert(at + i, b);
+        if self.blocks[ix].kind == BlockKind::Paragraph && self.blocks[ix].text.is_empty() {
+            let n = pasted.len();
+            self.blocks.splice(ix..ix + 1, pasted);
+            let last = ix + n - 1;
+            let end = if self.blocks[last].kind.has_text() { self.blocks[last].text.len() } else { 0 };
+            self.sel = Sel::caret(last, end);
+            self.after_edit(cx);
+            return;
         }
-        let last = at + n - 1;
-        self.sel = if self.blocks[last].kind.has_text() {
-            Sel::caret(last, self.blocks[last].text.len())
-        } else {
-            Sel::caret(last, 0)
-        };
+        // Split the current line around the caret, like Notion: the first
+        // pasted paragraph continues it and the rest of the line follows the paste.
+        let tail = self.blocks[ix].text.split_off(caret);
+        if pasted[0].kind == BlockKind::Paragraph && !self.blocks[ix].kind.is_raw() {
+            let first = pasted.remove(0);
+            self.blocks[ix].text.append(&first.text);
+        }
+        let at = if tail.is_empty() { subtree_end(&self.blocks, ix) } else { ix + 1 };
+        let n = pasted.len();
+        self.blocks.splice(at..at, pasted);
+        let last = if n == 0 { ix } else { at + n - 1 };
+        let end = if self.blocks[last].kind.has_text() { self.blocks[last].text.len() } else { 0 };
+        if !tail.is_empty() {
+            if self.blocks[last].kind.has_text() && !self.blocks[last].kind.is_raw() {
+                self.blocks[last].text.append(&tail);
+            } else {
+                let depth = self.blocks[ix].indent;
+                self.blocks.insert(last + 1, Block::paragraph(tail).with_indent(depth));
+            }
+        }
+        self.sel = Sel::caret(last, end);
         self.after_edit(cx);
     }
 
@@ -2318,6 +2378,29 @@ impl Editor {
 // IME / text input
 // --------------------------------------------------------------------------
 
+/// Plain text from other apps: every line becomes its own block (as in
+/// Notion), except inside code fences and tables.
+fn lines_as_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut in_fence = false;
+    let mut prev_content = false;
+    for line in text.split('\n') {
+        let t = line.trim_start();
+        let fence = t.starts_with("```");
+        let table = t.starts_with('|');
+        if !in_fence && prev_content && !t.is_empty() && !table && !fence {
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+        if fence {
+            in_fence = !in_fence;
+        }
+        prev_content = !in_fence && !t.is_empty() && !table && !fence;
+    }
+    out
+}
+
 impl EntityInputHandler for Editor {
     fn text_for_range(
         &mut self,
@@ -2394,7 +2477,7 @@ impl EntityInputHandler for Editor {
             .unwrap_or(self.sel.range.clone());
         self.checkpoint(EditKind::Typing);
         let ix = self.sel.block;
-        let marks = if matches!(self.blocks[ix].kind, BlockKind::Code { .. }) {
+        let marks = if self.blocks[ix].kind.is_raw() {
             Some(Marks::default())
         } else if range.is_empty() {
             self.pending_marks.clone()

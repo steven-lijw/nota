@@ -62,6 +62,41 @@ pub fn decode_url(url: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| url.to_string())
 }
 
+/// `|---|:---:|` style table separator rows.
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+}
+
+/// Split one table row into cell texts (inline Markdown), honouring `\|`.
+pub fn table_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').filter(|r| !r.ends_with('\\')).unwrap_or(t);
+    let mut cells = vec![String::new()];
+    let mut chars = t.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                cells.last_mut().unwrap().push('|');
+                chars.next();
+            }
+            '|' => cells.push(String::new()),
+            c => cells.last_mut().unwrap().push(c),
+        }
+    }
+    cells.into_iter().map(|c| c.trim().to_string()).collect()
+}
+
+/// Header and body rows of a table block's source (the separator row is dropped).
+pub fn table_rows(src: &str) -> Vec<Vec<String>> {
+    src.lines()
+        .enumerate()
+        .filter(|(i, l)| !(*i == 1 && is_table_separator(l)) && !l.trim().is_empty())
+        .map(|(_, l)| table_cells(l))
+        .collect()
+}
+
 /// A line that is just `![alt](src)` (Obsidian-style `![alt|400](src)` sets a
 /// width). Returns the byte length of the alt text, the decoded source and the width.
 fn parse_image_line(content: &str) -> Option<(usize, String, Option<u32>)> {
@@ -696,6 +731,15 @@ pub fn to_markdown(blocks: &[Block]) -> String {
                 out.push_str(&pad);
                 out.push_str(&format!("[[{}|{}]]", page, title.trim()));
             }
+            BlockKind::Table => {
+                for (li, line) in b.text.text.split('\n').enumerate() {
+                    if li > 0 {
+                        out.push('\n');
+                    }
+                    out.push_str(&pad);
+                    out.push_str(line.trim_end());
+                }
+            }
             BlockKind::Image { src, width } => {
                 let alt = b.text.text.replace(['[', ']', '|', '\n'], " ");
                 out.push_str(&pad);
@@ -772,7 +816,7 @@ fn strip_columns(line: &str, cols: usize) -> &str {
 pub fn from_markdown(src: &str) -> Vec<Block> {
     let mut out: Vec<Pending> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
-    let mut lines = src.lines();
+    let mut lines = src.lines().peekable();
     let mut prev_blank = true;
     let mut continuation = false;
 
@@ -831,6 +875,27 @@ pub fn from_markdown(src: &str) -> Vec<Block> {
             continue;
         }
 
+        // GFM table: a `|` row followed by a `|---|` separator row
+        if content.starts_with('|') && lines.peek().is_some_and(|next| is_table_separator(next)) {
+            let mut raw = content.trim_end().to_string();
+            while let Some(next) = lines.peek() {
+                let t = next.trim_start();
+                if !t.starts_with('|') {
+                    break;
+                }
+                raw.push('\n');
+                raw.push_str(t.trim_end());
+                lines.next();
+            }
+            out.push(Pending {
+                kind: BlockKind::Table,
+                indent: depth,
+                raw,
+            });
+            prev_blank = false;
+            continue;
+        }
+
         let (kind, text) = classify(content);
         let no_text = matches!(kind, BlockKind::Divider | BlockKind::PageLink { .. } | BlockKind::Image { .. });
         let (text, cont) = if no_text {
@@ -881,7 +946,9 @@ pub fn from_markdown(src: &str) -> Vec<Block> {
         .into_iter()
         .map(|p| {
             let text = match p.kind {
-                BlockKind::Code { .. } | BlockKind::PageLink { .. } | BlockKind::Image { .. } => RichText::plain(p.raw),
+                BlockKind::Code { .. } | BlockKind::Table | BlockKind::PageLink { .. } | BlockKind::Image { .. } => {
+                    RichText::plain(p.raw)
+                }
                 BlockKind::Divider => RichText::default(),
                 _ => inline_from_md(&p.raw),
             };

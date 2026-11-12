@@ -464,6 +464,19 @@ impl Editor {
                 let (src, width) = (src.clone(), *width);
                 self.render_image(ix, &src, width, scale, t, cx)
             }
+            // Tables show as a grid; the caret inside one reveals its Markdown.
+            BlockKind::Table if !is_cursor_block => crate::blocks_view::table_grid(&block.text.text, t, BASE)
+                .cursor_text()
+                .into_any_element(),
+            BlockKind::Table => div()
+                .flex_1()
+                .min_w_0()
+                .rounded(px(6.))
+                .bg(t.codeblock_bg)
+                .px(px(16.))
+                .py(px(10.))
+                .child(text)
+                .into_any_element(),
             _ => text.into_any_element(),
         };
 
@@ -762,7 +775,7 @@ impl Editor {
             || self.selecting
             || self.slash.is_some()
             || self.marked.is_some()
-            || matches!(self.cur().kind, BlockKind::Code { .. })
+            || self.cur().kind.is_raw()
         {
             return None;
         }

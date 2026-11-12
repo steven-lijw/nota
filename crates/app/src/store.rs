@@ -60,21 +60,39 @@ impl Store {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
-            this.update(cx, |this, _| this.flush()).ok();
+            this.update(cx, |this, cx| {
+                if this.flush() {
+                    this.reload(cx);
+                }
+            })
+            .ok();
         }));
     }
 
-    /// Write every pending change to disk now.
-    pub fn flush(&mut self) {
+    /// Write every pending change to disk now. Returns true when a page was
+    /// changed on disk by another program meanwhile: that page is left as
+    /// the other program wrote it and the caller should reload.
+    pub fn flush(&mut self) -> bool {
         let ids: Vec<String> = self.dirty.drain().collect();
+        let mut changed = Vec::new();
         for id in ids {
             if self.vault.page(&id).is_none() {
                 continue;
             }
             if let Err(err) = self.vault.save_page(&id) {
-                self.last_error = Some(format!("Could not save: {err:#}"));
+                match err.downcast_ref::<nota_core::ChangedOnDisk>() {
+                    Some(c) => changed.push(c.0.clone()),
+                    None => self.last_error = Some(format!("Could not save: {err:#}")),
+                }
             }
         }
+        if !changed.is_empty() {
+            self.last_error = Some(format!(
+                "{} changed on disk (by Nota AI or another app) — showing that version; your last few edits to it were not kept.",
+                changed.iter().map(|t| format!("“{t}”")).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        !changed.is_empty()
     }
 
     pub fn update_page(&mut self, id: &str, cx: &mut Context<Self>, f: impl FnOnce(&mut Page)) {

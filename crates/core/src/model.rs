@@ -37,12 +37,19 @@ pub enum BlockKind {
     /// page's file (normally `assets/…`), `width` is the display width in
     /// points (`None`: natural size, at most the column width).
     Image { src: String, width: Option<u32> },
+    /// A Markdown (GFM) table, kept as its source text.
+    Table,
 }
 
 impl BlockKind {
     /// Whether the block holds editable text.
     pub fn has_text(&self) -> bool {
         !matches!(self, BlockKind::Divider | BlockKind::PageLink { .. } | BlockKind::Image { .. })
+    }
+
+    /// Text that is kept verbatim: no inline formatting or Markdown shortcuts.
+    pub fn is_raw(&self) -> bool {
+        matches!(self, BlockKind::Code { .. } | BlockKind::Table)
     }
 
     pub fn is_list(&self) -> bool {
@@ -68,6 +75,7 @@ impl BlockKind {
             BlockKind::Code { .. } => "Code",
             BlockKind::PageLink { .. } => "Page",
             BlockKind::Image { .. } => "Image",
+            BlockKind::Table => "Table",
         }
     }
 }
@@ -655,6 +663,12 @@ pub struct Page {
     pub blocks: Vec<Block>,
     /// Path relative to the vault root, once the page has been written or loaded.
     pub file: Option<std::path::PathBuf>,
+    /// Modification time of the file when it was last read or written, to
+    /// notice changes made by other programs (or the AI).
+    pub disk_mtime: Option<std::time::SystemTime>,
+    /// Set when the file could not be understood (e.g. broken front matter):
+    /// such pages are shown read-only and never written back.
+    pub load_error: Option<String>,
 }
 
 impl Page {
@@ -679,6 +693,8 @@ impl Page {
             },
             blocks: vec![Block::paragraph("")],
             file: None,
+            disk_mtime: None,
+            load_error: None,
         }
     }
 

@@ -64,6 +64,9 @@ struct FrontMatter {
     schema: Vec<Property>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     views: Vec<View>,
+    /// Indices of toggle blocks that are expanded (Markdown has no syntax for it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    open_toggles: Vec<usize>,
 }
 
 /// Split a file into (front matter yaml, body).
@@ -106,6 +109,13 @@ pub fn page_to_file_content(page: &Page) -> String {
         props: page.props.clone(),
         schema,
         views,
+        open_toggles: page
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.kind, BlockKind::Toggle { open: true }))
+            .map(|(i, _)| i)
+            .collect(),
     };
     let yaml = serde_yaml::to_string(&fm).unwrap_or_default();
     format!("---\n{}---\n\n{}", yaml, to_markdown(&page.blocks))
@@ -115,10 +125,23 @@ pub fn page_to_file_content(page: &Page) -> String {
 /// are imported as new top-level pages.
 pub fn page_from_file_content(content: &str, fallback_title: &str) -> Page {
     let (yaml, body) = split_front_matter(content);
-    let fm: Option<FrontMatter> = yaml.and_then(|y| serde_yaml::from_str(y).ok());
+    let parsed: Option<Result<FrontMatter, String>> =
+        yaml.map(|y| serde_yaml::from_str::<FrontMatter>(y).map_err(|e| e.to_string()));
+    let load_error = match &parsed {
+        Some(Err(e)) => Some(format!("The front matter (the block between the --- lines) is not valid YAML: {e}")),
+        _ => None,
+    };
+    let fm: Option<FrontMatter> = parsed.and_then(|r| r.ok());
     let has_id = fm.as_ref().is_some_and(|f| !f.id.is_empty());
     let fm = fm.unwrap_or_default();
-    let mut blocks = from_markdown(body);
+    let mut blocks = from_markdown(if load_error.is_some() { content } else { body });
+    for &i in &fm.open_toggles {
+        if let Some(b) = blocks.get_mut(i) {
+            if let BlockKind::Toggle { open } = &mut b.kind {
+                *open = true;
+            }
+        }
+    }
 
     let mut title = fm.title;
     if !has_id && title.is_empty() {
@@ -170,8 +193,26 @@ pub fn page_from_file_content(content: &str, fallback_title: &str) -> Page {
         database,
         blocks,
         file: None,
+        disk_mtime: None,
+        load_error,
     }
 }
+
+fn mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Saving was refused because another program changed the file meanwhile.
+#[derive(Debug)]
+pub struct ChangedOnDisk(pub String);
+
+impl std::fmt::Display for ChangedOnDisk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "“{}” was changed outside Nota", self.0)
+    }
+}
+
+impl std::error::Error for ChangedOnDisk {}
 
 pub fn sanitize_file_name(title: &str) -> String {
     let mut s: String = title
@@ -283,6 +324,7 @@ impl Vault {
                     .unwrap_or_default();
                 let mut page = page_from_file_content(&content, &stem);
                 page.file = path.strip_prefix(root).ok().map(|p| p.to_path_buf());
+                page.disk_mtime = mtime(&path);
                 if out.contains_key(&page.id) {
                     // duplicate id (a copied file): give the copy a fresh identity
                     page.id = new_id();
@@ -592,6 +634,15 @@ impl Vault {
         let Some(page) = self.pages.get_mut(id) else {
             return Ok(());
         };
+        if page.load_error.is_some() {
+            return Ok(()); // never overwrite a file we could not read properly
+        }
+        if let Some(old) = &page.file {
+            let on_disk = mtime(&root.join(old));
+            if on_disk.is_some() && page.disk_mtime.is_some() && on_disk != page.disk_mtime {
+                return Err(ChangedOnDisk(page.display_title().to_string()).into());
+            }
+        }
         let short = &page.id[..page.id.len().min(8)];
         let desired = format!("{} {}.md", sanitize_file_name(&page.title), short);
         let old_rel = page.file.clone();
@@ -614,6 +665,7 @@ impl Vault {
             }
         }
         page.file = Some(new_rel);
+        page.disk_mtime = mtime(&new_abs);
         Ok(())
     }
 
@@ -763,6 +815,81 @@ impl Vault {
             }
         }
         touched
+    }
+
+    /// Rename a select / status option, in the schema, every row and filter.
+    /// Returns the pages that changed (nothing if `new` is taken or empty).
+    pub fn rename_option(&mut self, db_id: &str, prop: &str, old: &str, new: &str) -> Vec<String> {
+        let new = new.trim();
+        let mut touched = vec![];
+        if new.is_empty() || old == new {
+            return touched;
+        }
+        let Some(db) = self.pages.get_mut(db_id).and_then(|p| p.database.as_mut()) else {
+            return touched;
+        };
+        let Some(p) = db.prop_mut(prop) else { return touched };
+        if p.options.iter().any(|o| o.name == new) {
+            return touched;
+        }
+        for o in &mut p.options {
+            if o.name == old {
+                o.name = new.to_string();
+            }
+        }
+        for v in &mut db.views {
+            for f in &mut v.filters {
+                if f.prop == prop && f.value == old {
+                    f.value = new.to_string();
+                }
+            }
+        }
+        touched.push(db_id.to_string());
+        self.map_option_values(db_id, prop, old, Some(new), &mut touched);
+        touched
+    }
+
+    /// Remove an option from a property and from every row that uses it.
+    pub fn delete_option(&mut self, db_id: &str, prop: &str, name: &str) -> Vec<String> {
+        let mut touched = vec![];
+        if let Some(p) = self.pages.get_mut(db_id).and_then(|p| p.database.as_mut()).and_then(|d| d.prop_mut(prop)) {
+            p.options.retain(|o| o.name != name);
+            touched.push(db_id.to_string());
+        }
+        self.map_option_values(db_id, prop, name, None, &mut touched);
+        touched
+    }
+
+    fn map_option_values(&mut self, db_id: &str, prop: &str, old: &str, new: Option<&str>, touched: &mut Vec<String>) {
+        for p in self.pages.values_mut() {
+            if p.parent.as_deref() != Some(db_id) {
+                continue;
+            }
+            let Some(v) = p.props.get_mut(prop) else { continue };
+            let changed = match v {
+                PropValue::Text(s) if s == old => {
+                    match new {
+                        Some(n) => *s = n.to_string(),
+                        None => s.clear(),
+                    }
+                    true
+                }
+                PropValue::List(l) if l.iter().any(|x| x == old) => {
+                    match new {
+                        Some(n) => l.iter_mut().filter(|x| *x == old).for_each(|x| *x = n.to_string()),
+                        None => l.retain(|x| x != old),
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if changed {
+                if v.is_empty() {
+                    p.props.remove(prop);
+                }
+                touched.push(p.id.clone());
+            }
+        }
     }
 
     /// Remove a property from a database and all of its rows.
@@ -945,5 +1072,105 @@ mod tests {
             assert_eq!(p.database, q.database);
         }
         std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+
+    fn vault(name: &str) -> Vault {
+        let dir = std::env::temp_dir().join(format!("nota-more-{}-{}", name, new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Vault { root: dir, pages: HashMap::new() }
+    }
+
+    #[test]
+    fn open_toggles_survive_a_reload() {
+        let mut v = vault("toggles");
+        let id = v.create_page(PageKind::Page, None);
+        v.page_mut(&id).unwrap().blocks = vec![
+            Block::new(BlockKind::Toggle { open: true }, "open"),
+            Block::paragraph("in").with_indent(1),
+            Block::new(BlockKind::Toggle { open: false }, "closed"),
+        ];
+        v.save_page(&id).unwrap();
+        v.load().unwrap();
+        let kinds: Vec<BlockKind> = v.page(&id).unwrap().blocks.iter().map(|b| b.kind.clone()).collect();
+        assert_eq!(kinds[0], BlockKind::Toggle { open: true });
+        assert_eq!(kinds[2], BlockKind::Toggle { open: false });
+    }
+
+    #[test]
+    fn broken_front_matter_is_never_overwritten() {
+        let mut v = vault("broken");
+        let path = v.root.join("bad.md");
+        let original = "---\nid: abc\ntitle: [unclosed\n---\n\nbody\n";
+        std::fs::write(&path, original).unwrap();
+        v.load().unwrap();
+        let id = v.pages.keys().next().unwrap().clone();
+        assert!(v.page(&id).unwrap().load_error.is_some());
+        v.page_mut(&id).unwrap().title = "changed".into();
+        v.save_page(&id).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn external_change_blocks_save() {
+        let mut v = vault("conflict");
+        let id = v.create_page(PageKind::Page, None);
+        v.save_page(&id).unwrap();
+        let abs = v.abs_path(&id).unwrap();
+        // someone else rewrites the file a bit later
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let content = std::fs::read_to_string(&abs).unwrap().replace("\n\n", "\n\nexternal\n");
+        std::fs::write(&abs, &content).unwrap();
+        let f = std::fs::File::options().write(true).open(&abs).unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
+        v.page_mut(&id).unwrap().title = "mine".into();
+        let err = v.save_page(&id).unwrap_err();
+        assert!(err.downcast_ref::<ChangedOnDisk>().is_some());
+        assert!(std::fs::read_to_string(&abs).unwrap().contains("external"));
+    }
+
+    #[test]
+    fn tables_are_kept() {
+        let src = "intro\n\n| a | b |\n|---|:-:|\n| 1 | x \\| y |\n\nafter\n";
+        let blocks = crate::markdown::from_markdown(src);
+        assert_eq!(blocks[1].kind, BlockKind::Table);
+        assert_eq!(crate::markdown::to_markdown(&blocks), src);
+        let rows = crate::markdown::table_rows(&blocks[1].text.text);
+        assert_eq!(rows, vec![vec!["a", "b"], vec!["1", "x | y"]]);
+        // a lone pipe line is still a paragraph
+        assert_eq!(crate::markdown::from_markdown("| not a table\n")[0].kind, BlockKind::Paragraph);
+    }
+}
+
+#[cfg(test)]
+mod option_tests {
+    use super::*;
+
+    #[test]
+    fn rename_and_delete_options() {
+        let dir = std::env::temp_dir().join(format!("nota-opt-{}", new_id()));
+        let mut v = Vault { root: dir, pages: HashMap::new() };
+        let db = v.create_page(PageKind::Database, None);
+        {
+            let d = v.page_mut(&db).unwrap().database.as_mut().unwrap();
+            let mut p = Property::new("Tags", PropKind::MultiSelect);
+            p.ensure_option("a");
+            p.ensure_option("b");
+            d.schema = vec![Property::new("Name", PropKind::Title), p];
+        }
+        let row = v.create_page(PageKind::Page, Some(db.clone()));
+        v.page_mut(&row).unwrap().props.insert("Tags".into(), PropValue::List(vec!["a".into(), "b".into()]));
+        let touched = v.rename_option(&db, "Tags", "a", "alpha");
+        assert!(touched.contains(&row));
+        assert_eq!(v.page(&row).unwrap().props["Tags"], PropValue::List(vec!["alpha".into(), "b".into()]));
+        assert!(v.rename_option(&db, "Tags", "b", "alpha").is_empty(), "name taken");
+        v.delete_option(&db, "Tags", "alpha");
+        v.delete_option(&db, "Tags", "b");
+        assert!(v.page(&row).unwrap().props.get("Tags").is_none());
+        assert!(v.page(&db).unwrap().database.as_ref().unwrap().prop("Tags").unwrap().options.is_empty());
     }
 }

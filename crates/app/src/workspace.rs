@@ -77,6 +77,8 @@ pub struct Workspace {
     search: Option<Search>,
     menu: Option<(Menu, Point<Pixels>)>,
     side_drop: Option<(String, Zone)>,
+    /// Recently shown pages, kept alive so going back restores scroll and undo.
+    recent: Vec<(String, Entity<PageView>)>,
     _page_sub: Option<Subscription>,
     _subs: Vec<Subscription>,
 }
@@ -119,6 +121,7 @@ impl Workspace {
             search: None,
             menu: None,
             side_drop: None,
+            recent: Vec::new(),
             _page_sub: None,
             _subs: subs,
         };
@@ -146,7 +149,18 @@ impl Workspace {
         window.focus(&self.focus);
         if let Some(id) = id.clone() {
             let store = self.store.clone();
-            let view = cx.new(|cx| PageView::new(store, id.clone(), window, cx));
+            let cached = self.recent.iter().position(|(pid, _)| *pid == id).map(|i| self.recent.remove(i).1);
+            let view = match cached {
+                Some(view) => {
+                    view.update(cx, |v, cx| v.refresh(cx));
+                    view
+                }
+                None => cx.new(|cx| PageView::new(store, id.clone(), window, cx)),
+            };
+            self.recent.push((id.clone(), view.clone()));
+            if self.recent.len() > 8 {
+                self.recent.remove(0);
+            }
             self._page_sub = Some(cx.subscribe_in(&view, window, |this: &mut Self, _, ev: &PageEvent, window, cx| {
                 let PageEvent::Open(id) = ev;
                 this.open(id.clone(), window, cx)
@@ -362,6 +376,7 @@ impl Workspace {
                     crate::save_vault_path(&path);
                     this.current = None;
                     this.page = None;
+                    this.recent.clear();
                     let dark = this.store.update(cx, |s, cx| {
                         s.switch_vault(vault, cx);
                         s.state.dark
