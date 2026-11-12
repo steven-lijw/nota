@@ -14,6 +14,16 @@ cargo run --release              # 第一次编译大约 5–10 分钟
 ./scripts/bundle-macos.sh        # 打包成 dist/Nota.app，可以拖进「应用程序」
 ```
 
+## 下载与自动更新
+
+每次 push 到 `main`，GitHub Actions 会构建并发布一个 Release（版本号 `0.1.<构建序号>`），附带 DMG 和更新用的 zip。其他分支只构建，产物在 Actions 页面的 Artifacts 里。
+
+装好的 Nota.app 启动几秒后、之后每隔几小时会检查 Release，在后台下载并校验 SHA-256；下载好后侧边栏底部出现「Restart to update」，点一下就替换 app 并重启。也可以在菜单 Nota → Check for Updates… 或 Settings 里手动检查。
+
+- 仓库需要是 public，app 才能匿名读取 Release。
+- 只有从 `.app` 运行的版本会自动更新，`cargo run` 不会。
+- app 没有 Apple 公证：第一次安装仍需右键 → 打开；之后的自动更新不会再被拦截。
+
 ## Vault
 
 按以下顺序决定用哪个文件夹：
@@ -44,11 +54,13 @@ props:                  # 数据库行的属性值
 
 ## 功能
 
-**块编辑器**：正文、H1–H3、无序/有序/待办/折叠列表、引用、Callout、代码块、分割线、子页面链接。`/` 菜单（支持中文/拼音关键词筛选）、Markdown 快捷输入（`# `、`- `、`1. `、`[] `、`> `、`" `、```` ``` ````、`---`）、行内 `**粗体**` `*斜体*` `` `代码` `` `~~删除线~~`、选中文字浮出格式工具栏、左侧 `+` 和拖拽手柄、块菜单（删除/复制/转换）、多块选择、撤销重做、复制粘贴（Markdown）、中文输入法。
+**块编辑器**：正文、H1–H3、无序/有序/待办/折叠列表、引用、Callout、代码块、分割线、子页面链接、图片、表格。`/` 菜单（支持中文/拼音关键词筛选）、Markdown 快捷输入（`# `、`- `、`1. `、`[] `、`> `、`" `、```` ``` ````、`---`）、行内 `**粗体**` `*斜体*` `` `代码` `` `~~删除线~~`、选中文字浮出格式工具栏、左侧 `+` 和拖拽手柄（拖动时有蓝线指示落点，左右移动决定缩进，选中多块可一起拖）、在页面空白处拖出选框选中多个块、块菜单（删除/复制/转换）、撤销重做、复制粘贴（Markdown）、中文输入法。选中文字按 `⌘K` 加链接；代码块可以选语言；Callout 图标点开是 emoji 选择器。
 
-**数据库**：Table / Board / List / Gallery / Calendar 五种视图，每个视图独立的筛选、排序、隐藏属性、分组属性和日期属性。属性类型：Text、Number、Select、Multi-select、Status、Date、Checkbox、URL。看板和日历支持拖拽改值。点单元格直接编辑，打开行就是一个完整页面。
+**图片**：把图片文件或截图拖进页面，或 `⌘V` 粘贴剪贴板里的图片，或 `/image` 选文件。图片复制到 vault 的 `assets/` 文件夹，正文里是标准的 `![说明](assets/…)`（自定义宽度写成 `![说明|400](…)`，和 Obsidian 一样）。拖图片两侧的手柄调大小。
 
-**其他**：侧边栏页面树（拖拽移动、收藏、右键菜单）、面包屑、前进后退、`⌘K` 搜索、回收站（恢复/彻底删除）、Emoji 图标、深色模式、在 Finder 中显示。
+**数据库**：Table / Board / List / Gallery / Calendar 五种视图，每个视图独立的筛选、排序、隐藏属性、分组属性和日期属性。属性类型：Text、Number、Select、Multi-select、Status、Date、Checkbox、URL。看板和日历支持拖拽改值；看板列内、表格和列表里拖动都会显示插入位置并记住顺序（视图没有排序时）。点行/卡片在右侧 Peek 里打开，表头右边缘可以拖动调列宽。Select/Status 的选项可以改名、改颜色、删除。点单元格直接编辑，打开行就是一个完整页面。
+
+**其他**：侧边栏和 AI 面板可以拖边缘调宽；侧边栏页面树（拖到页面上下边缘调整顺序、拖到页面中间放进去、收藏、右键菜单）、面包屑、前进后退、`⌘K` 搜索、回收站（恢复/彻底删除）、Emoji 图标、深色模式、在 Finder 中显示。
 
 ## AI 面板（`⌘J`）
 
@@ -60,6 +72,8 @@ claude -p --output-format stream-json --verbose --include-partial-messages …
 
 - 当前页面内容会作为上下文一起发过去（点输入框上方的页面标签可以关掉）。
 - 同一个对话会用 `--resume` 接着上一轮。
+- 在页面里选中文字或块，面板里会出现选区标签，提问时一起发过去；回答下面有「Replace selection」「Insert below」。选中文字后浮动工具栏里也有「Ask AI」。
+- 输入框下面可以选 Model（Default/Fable/Opus/Sonnet/Haiku）和 Thinking effort（Default/Low…Max），对应 `--model` / `--effort`，按 vault 记住。
 - 默认 **Read-only**：只允许 `Read`/`Glob`/`Grep`，Claude 能翻你的整个 vault 来回答问题，但不能改文件。回答下方有「Insert into page」可以把内容插进当前页面。
 - 切换到 **Can edit your pages** 后用 `--permission-mode acceptEdits`，Claude 可以直接新建或修改 vault 里的 Markdown 文件，结束后 Nota 会自动重新加载。
 

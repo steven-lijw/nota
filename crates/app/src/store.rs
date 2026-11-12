@@ -1,13 +1,15 @@
 //! The shared, observable model: the vault plus debounced autosave.
 
 use gpui::{Context, EventEmitter, Task};
-use nota_core::{AppState, Page, PageKind, PropValue, Vault};
+use nota_core::{Anchor, AppState, Page, PageKind, PropValue, Vault};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 pub enum StoreEvent {
     /// The vault was re-read from disk (e.g. after the AI edited files).
     Reloaded,
+    /// A page's body was changed by something other than its editor.
+    BlocksChanged(String),
 }
 
 pub struct Store {
@@ -58,21 +60,39 @@ impl Store {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
-            this.update(cx, |this, _| this.flush()).ok();
+            this.update(cx, |this, cx| {
+                if this.flush() {
+                    this.reload(cx);
+                }
+            })
+            .ok();
         }));
     }
 
-    /// Write every pending change to disk now.
-    pub fn flush(&mut self) {
+    /// Write every pending change to disk now. Returns true when a page was
+    /// changed on disk by another program meanwhile: that page is left as
+    /// the other program wrote it and the caller should reload.
+    pub fn flush(&mut self) -> bool {
         let ids: Vec<String> = self.dirty.drain().collect();
+        let mut changed = Vec::new();
         for id in ids {
             if self.vault.page(&id).is_none() {
                 continue;
             }
             if let Err(err) = self.vault.save_page(&id) {
-                self.last_error = Some(format!("Could not save: {err:#}"));
+                match err.downcast_ref::<nota_core::ChangedOnDisk>() {
+                    Some(c) => changed.push(c.0.clone()),
+                    None => self.last_error = Some(format!("Could not save: {err:#}")),
+                }
             }
         }
+        if !changed.is_empty() {
+            self.last_error = Some(format!(
+                "{} changed on disk (by Nota AI or another app) — showing that version; your last few edits to it were not kept.",
+                changed.iter().map(|t| format!("“{t}”")).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        !changed.is_empty()
     }
 
     pub fn update_page(&mut self, id: &str, cx: &mut Context<Self>, f: impl FnOnce(&mut Page)) {
@@ -124,6 +144,13 @@ impl Store {
         }
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    /// Move a page among its (new) siblings; saves every page whose order changed.
+    pub fn place_page(&mut self, id: &str, parent: Option<String>, anchor: Anchor, cx: &mut Context<Self>) {
+        let touched = self.vault.place_page(id, parent, anchor);
+        self.vault.touch(id);
+        self.mark_many(&touched, cx);
     }
 
     /// Flush, then re-read the whole vault from disk.

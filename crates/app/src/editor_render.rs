@@ -3,13 +3,15 @@
 
 use crate::actions::*;
 use crate::blocks_view::{block_text, bullet_glyph, marker_box, top_margin};
-use crate::editor::{BlockMenu, DragBlock, Editor, EditorEvent, Sel};
+use crate::editor::{lang_label, BlockMenu, BlockPicker, DragBlock, Editor, EditorEvent, ResizeImage, Sel, CODE_LANGS, INDENT_PX};
+use crate::theme::PAGE_MAX_W;
 use crate::text_view::{TextLayout, TextView};
 use crate::theme::{theme, ui_font, Theme};
 use crate::ui::*;
 use gpui::{
-    anchored, deferred, div, font, point, prelude::*, px, AnyElement, Context, Corner,
-    ElementInputHandler, FontWeight, MouseButton, SharedString, TextRun, Window,
+    anchored, canvas, deferred, div, font, img, point, prelude::*, px, AnyElement, Context, Corner,
+    DispatchPhase, DragMoveEvent, ElementInputHandler, ExternalPaths, FontWeight, Hsla, MouseButton,
+    MouseMoveEvent, MouseUpEvent, SharedString, TextRun, Window,
 };
 use nota_core::{list_number, visibility, Block, BlockKind, MarkKind};
 use std::collections::HashSet;
@@ -17,11 +19,20 @@ use std::collections::HashSet;
 /// Rows extend this far into the page margins so the hover handles stay
 /// inside the row's hit area.
 pub const GUTTER: f32 = 50.0;
-const INDENT: f32 = 24.0;
+const INDENT: f32 = INDENT_PX;
 const BASE: f32 = 16.0;
 
 pub struct DragPreview {
     label: SharedString,
+}
+
+/// Nothing follows the pointer while an image is resized.
+pub struct NoPreview;
+
+impl Render for NoPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
 }
 
 impl Render for DragPreview {
@@ -89,7 +100,110 @@ impl Editor {
         cx.notify();
     }
 
-    fn render_block(&self, ix: usize, focused: bool, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// Widest an image may be in this block's column.
+    fn column_width(&self, ix: usize) -> f32 {
+        let b = &self.blocks[ix];
+        let indent = b.indent as f32 * INDENT;
+        self.row_bounds
+            .borrow()
+            .get(&b.id)
+            .map(|r| r.size.width / px(1.) - 2. * GUTTER - indent)
+            .unwrap_or(PAGE_MAX_W - indent)
+            .max(80.)
+    }
+
+    fn render_image(&self, ix: usize, src: &str, width: Option<u32>, scale: f32, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let id = self.blocks[ix].id;
+        let path = self.store.read(cx).vault.resolve_src(&self.page_id, src);
+        let Some(path) = path.filter(|p| p.is_file()) else {
+            return div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .gap(px(8.))
+                .h(px(44.))
+                .px(px(12.))
+                .rounded(px(4.))
+                .bg(t.hover)
+                .text_size(px(14.))
+                .text_color(t.text_faint)
+                .child(icon("image", 16., t.text_faint))
+                .child(SharedString::from(format!("Image not found: {src}")))
+                .into_any_element();
+        };
+        let max = self.column_width(ix);
+        let natural = self.image_size(&path).map(|(w, _)| w as f32 / scale.max(1.));
+        let w = width.map(|w| w as f32).or(natural).unwrap_or(max).min(max).max(48.);
+        let group: SharedString = format!("img-{id}").into();
+        let stop = |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| cx.stop_propagation();
+        let handle = |side: f32| {
+            let mut h = div()
+                .id(if side < 0. { ("img-l", id as usize) } else { ("img-r", id as usize) })
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .w(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_ew_resize()
+                .opacity(0.)
+                .group_hover(group.clone(), |s| s.opacity(1.))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.start_resize(id, ev.position.x, w);
+                    }),
+                )
+                .on_drag(ResizeImage { id, side }, |_, _, _, cx| cx.new(|_| NoPreview))
+                .child(
+                    div()
+                        .w(px(6.))
+                        .h(px(48.).min(px(w * 0.4)))
+                        .rounded(px(3.))
+                        .bg(Hsla { a: 0.6, ..gpui::black() })
+                        .border_1()
+                        .border_color(Hsla { a: 0.9, ..gpui::white() }),
+                );
+            h = if side < 0. { h.left(px(2.)) } else { h.right(px(2.)) };
+            h
+        };
+        let faint = t.text_faint;
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .justify_center()
+            .py(px(4.))
+            .child(
+                div()
+                    .id(("img", id as usize))
+                    .group(group.clone())
+                    .relative()
+                    .w(px(w))
+                    .on_mouse_down(MouseButton::Right, stop)
+                    .child(
+                        img(path)
+                            .w(px(w))
+                            .rounded(px(3.))
+                            .with_fallback(move || {
+                                div()
+                                    .h(px(44.))
+                                    .flex()
+                                    .items_center()
+                                    .text_color(faint)
+                                    .child("This image could not be shown")
+                                    .into_any_element()
+                            }),
+                    )
+                    .child(handle(-1.))
+                    .child(handle(1.)),
+            )
+            .into_any_element()
+    }
+
+    fn render_block(&self, ix: usize, last_visible: bool, focused: bool, scale: f32, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let block: &Block = &self.blocks[ix];
         let id = block.id;
         let bt = block_text(block, t, BASE);
@@ -125,6 +239,12 @@ impl Editor {
                 .input(move |bounds, window, cx| {
                     window.handle_input(&focus, ElementInputHandler::new(bounds, entity), cx);
                 });
+        }
+        // Keep showing the selection while focus is elsewhere (e.g. the AI panel).
+        let idle_sel = !focused && self.block_sel.is_none() && self.sel.block == ix && !self.sel.range.is_empty();
+        if idle_sel {
+            let dim = Hsla { a: t.selection.a * 0.6, ..t.selection };
+            text_view = text_view.selection(Some(self.sel.range.clone()), dim);
         }
         if let Some(ph) = placeholder_for(&block.kind, is_cursor_block) {
             let mut f = font(ui_font());
@@ -264,31 +384,55 @@ impl Editor {
                             .cursor_pointer()
                             .hover(move |s| s.bg(hover))
                             .on_mouse_down(MouseButton::Left, stop)
-                            .on_click(cx.listener(move |this, _, _, cx| this.cycle_callout_icon(ix, cx)))
+                            .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
+                                this.picker = Some((ix, BlockPicker::CalloutIcon, ev.position()));
+                                cx.notify();
+                            }))
                             .child(SharedString::from(emoji.clone())),
                     )
                     .child(text)
                     .into_any_element()
             }
             BlockKind::Code { lang } => {
-                handle_offset = if lang.is_empty() { 16.0 } else { 30.0 };
-                let mut code = div()
+                handle_offset = 30.0;
+                let hover = t.hover;
+                let code_group: SharedString = format!("code-{id}").into();
+                div()
+                    .group(code_group.clone())
                     .flex_1()
                     .min_w_0()
                     .rounded(px(6.))
                     .bg(t.codeblock_bg)
                     .px(px(16.))
-                    .py(px(16.));
-                if !lang.is_empty() {
-                    code = code.pt(px(8.)).child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(t.text_faint)
-                            .pb(px(6.))
-                            .child(SharedString::from(lang.clone())),
-                    );
-                }
-                code.child(text).into_any_element()
+                    .pt(px(8.))
+                    .pb(px(16.))
+                    .child(
+                        div().flex().pb(px(6.)).child(
+                            div()
+                                .id(("code-lang", id as usize))
+                                .flex()
+                                .items_center()
+                                .gap(px(2.))
+                                .h(px(20.))
+                                .px(px(4.))
+                                .ml(px(-4.))
+                                .rounded(px(4.))
+                                .text_size(px(12.))
+                                .text_color(t.text_faint)
+                                .cursor_pointer()
+                                .when(lang.is_empty(), |d| d.opacity(0.).group_hover(code_group.clone(), |s| s.opacity(1.)))
+                                .hover(move |s| s.bg(hover))
+                                .on_mouse_down(MouseButton::Left, stop)
+                                .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
+                                    this.picker = Some((ix, BlockPicker::Language, ev.position()));
+                                    cx.notify();
+                                }))
+                                .child(SharedString::from(lang_label(lang).to_string()))
+                                .child(icon("chevron-down", 10., t.text_faint)),
+                        ),
+                    )
+                    .child(text)
+                    .into_any_element()
             }
             BlockKind::Divider => div()
                 .flex()
@@ -346,12 +490,33 @@ impl Editor {
                         .into_any_element(),
                 }
             }
+            BlockKind::Image { src, width } => {
+                let (src, width) = (src.clone(), *width);
+                self.render_image(ix, &src, width, scale, t, cx)
+            }
+            // Tables show as a grid; the caret inside one reveals its Markdown.
+            BlockKind::Table if !is_cursor_block => crate::blocks_view::table_grid(&block.text.text, t, BASE)
+                .cursor_text()
+                .into_any_element(),
+            BlockKind::Table => div()
+                .flex_1()
+                .min_w_0()
+                .rounded(px(6.))
+                .bg(t.codeblock_bg)
+                .px(px(16.))
+                .py(px(10.))
+                .child(text)
+                .into_any_element(),
             _ => text.into_any_element(),
         };
 
         // --- hover handles -----------------------------------------------------
         let hover = t.hover;
         let label: String = block.text.text.chars().take(60).collect();
+        let drag_count = {
+            let r = self.moving_range(ix);
+            if r.len() > 1 && self.block_sel_range().is_some_and(|s| s.contains(&ix)) { r.len() } else { 1 }
+        };
         let handle_top = pad_y + handle_offset + ((lh / px(1.)) - 24.0) / 2.0;
         let handles = div()
             .absolute()
@@ -398,7 +563,8 @@ impl Editor {
                     }))
                     .on_drag(
                         DragBlock {
-                            ix,
+                            id,
+                            count: drag_count,
                             label: if label.is_empty() {
                                 block.kind.label().to_string()
                             } else {
@@ -406,7 +572,11 @@ impl Editor {
                             },
                         },
                         |drag: &DragBlock, _, _, cx| {
-                            let label: SharedString = drag.label.clone().into();
+                            let label: SharedString = if drag.count > 1 {
+                                format!("{} blocks", drag.count).into()
+                            } else {
+                                drag.label.clone().into()
+                            };
                             cx.new(|_| DragPreview { label })
                         },
                     )
@@ -414,6 +584,8 @@ impl Editor {
             );
 
         let accent = t.accent;
+        let mt = top_margin(&block.kind, ix == 0, BASE);
+        let rows = self.row_bounds.clone();
         let mut row = div()
             .id(("block", id as usize))
             .group(group.clone())
@@ -423,14 +595,23 @@ impl Editor {
             .w_full()
             .pl(px(GUTTER + indent_px))
             .pr(px(GUTTER))
-            .mt(px(top_margin(&block.kind, ix == 0, BASE)))
+            .mt(px(mt))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, ev, window, cx| this.mouse_down_on_block(ix, ev, window, cx)),
             )
-            .on_drop(cx.listener(move |this, drag: &DragBlock, _, cx| {
-                this.move_block_after(drag.ix, ix, cx);
-            }));
+            .child(
+                canvas(move |bounds, _, _| {
+                    rows.borrow_mut().insert(id, bounds);
+                }, |_, _, _, _| {})
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            );
+        if self.drag_range.as_ref().is_some_and(|r| r.contains(&ix)) {
+            row = row.opacity(0.4);
+        }
         if in_block_sel {
             row = row.child(
                 div()
@@ -443,19 +624,185 @@ impl Editor {
                     .bg(t.block_selection),
             );
         }
-        row.child(handles)
-            .child(content)
-            .child(
+        row = row.child(handles).child(content);
+        if let Some(target) = self.drop_target {
+            let line = |indent: u8| {
                 div()
                     .absolute()
-                    .left(px(GUTTER + indent_px))
+                    .left(px(GUTTER + indent as f32 * INDENT))
                     .right(px(GUTTER))
-                    .bottom(px(-2.))
                     .h(px(3.))
                     .rounded(px(1.5))
-                    .group_drag_over::<DragBlock>(group, move |s| s.bg(accent)),
+                    .bg(accent)
+            };
+            if target.gap == ix {
+                row = row.child(line(target.indent).top(px(-(mt / 2.0) - 2.)));
+            } else if target.gap >= self.blocks.len() && last_visible {
+                row = row.child(line(target.indent).bottom(px(-3.)));
+            }
+        }
+        row.into_any_element()
+    }
+
+    fn render_marquee(&self, t: &Theme) -> Option<AnyElement> {
+        let m = self.marquee.as_ref().filter(|m| m.active)?;
+        let origin = self.marquee_origin()?;
+        let (l, r) = (origin.x.min(m.current.x), origin.x.max(m.current.x));
+        let (top, bottom) = (origin.y.min(m.current.y), origin.y.max(m.current.y));
+        let tint = |a: f32| Hsla { a, ..t.accent };
+        Some(
+            deferred(
+                anchored().position(point(l, top)).snap_to_window().child(
+                    div()
+                        .w(r - l)
+                        .h(bottom - top)
+                        .rounded(px(2.))
+                        .bg(tint(0.10))
+                        .border_1()
+                        .border_color(tint(0.40)),
+                ),
             )
-            .into_any_element()
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// The ⌘K link field, under the linked text.
+    fn render_link_editor(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let edit = self.link_edit.as_ref()?;
+        let layout = self.layout_of(edit.block)?;
+        let rect = layout.rects_for_range(edit.range.clone()).into_iter().last().unwrap_or(layout.caret_bounds(edit.range.end));
+        let mut menu = menu_surface(t).w(px(340.)).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .mx(px(8.))
+                .my(px(4.))
+                .px(px(8.))
+                .py(px(5.))
+                .rounded(px(6.))
+                .bg(t.hover)
+                .border_1()
+                .border_color(t.accent)
+                .child(icon("link", 14., t.text_faint))
+                .child(div().flex_1().min_w_0().child(edit.input.clone())),
+        );
+        menu = menu.child(
+            menu_item("link-apply", Some("check"), "Apply (Enter)", t)
+                .on_click(cx.listener(|this, _, window, cx| this.apply_link(window, cx))),
+        );
+        if edit.had_link {
+            menu = menu.child(
+                menu_item("link-remove", Some("trash"), "Remove link", t)
+                    .on_click(cx.listener(|this, _, window, cx| this.remove_link(window, cx))),
+            );
+        }
+        Some(popover(
+            point(rect.left(), rect.bottom() + px(6.)),
+            Corner::TopLeft,
+            menu,
+            cx.listener(|this, _, window, cx| {
+                this.link_edit = None;
+                window.focus(&this.focus);
+                cx.notify();
+            }),
+        ))
+    }
+
+    /// With the caret inside a link: show where it goes, with Open / Edit.
+    fn render_link_chip(&self, focused: bool, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !focused || self.link_edit.is_some() || self.block_sel.is_some() || !self.sel.range.is_empty() || self.slash.is_some() {
+            return None;
+        }
+        let ix = self.sel.block;
+        let (range, url) = self.link_at(ix, self.cursor())?;
+        let layout = self.layout_of(ix)?;
+        let caret = layout.caret_bounds(self.cursor());
+        let shown: String = url.chars().take(44).collect();
+        let shown = if url.chars().count() > 44 { format!("{shown}…") } else { shown };
+        let (open_url, edit_url) = (url.clone(), url.clone());
+        let chip = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .p(px(3.))
+            .pl(px(8.))
+            .bg(t.panel_bg)
+            .border_1()
+            .border_color(t.border)
+            .rounded(px(8.))
+            .shadow(popover_shadow(t))
+            .text_size(px(13.))
+            .child(icon("link", 13., t.text_faint))
+            .child(div().max_w(px(260.)).whitespace_nowrap().overflow_hidden().text_color(t.text_muted).child(SharedString::from(shown)))
+            .child(
+                text_button("link-open", "Open", t).on_click(cx.listener(move |_, _, _, cx| cx.open_url(&open_url))),
+            )
+            .child(text_button("link-edit", "Edit", t).on_click(cx.listener(move |this, _, window, cx| {
+                this.open_link_editor(ix, range.clone(), edit_url.clone(), window, cx)
+            })));
+        Some(
+            deferred(
+                anchored()
+                    .position(point(caret.left(), caret.bottom() + px(6.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(div().occlude().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(chip)),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// Code language list / callout emoji grid.
+    fn render_picker(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (ix, picker, pos) = self.picker?;
+        let block = self.blocks.get(ix)?;
+        let menu = match (picker, &block.kind) {
+            (BlockPicker::Language, BlockKind::Code { lang }) => {
+                let mut list = div().id("lang-list").flex().flex_col().max_h(px(320.)).overflow_y_scroll();
+                for (i, l) in CODE_LANGS.iter().enumerate() {
+                    let mut item = menu_item(("lang", i), None, lang_label(l).to_string(), t)
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_code_lang(ix, l, cx)));
+                    if lang == l {
+                        item = item.child(icon("check", 14., t.text_muted));
+                    }
+                    list = list.child(item);
+                }
+                menu_surface(t).w(px(200.)).child(menu_label("Language", t)).child(list)
+            }
+            (BlockPicker::CalloutIcon, BlockKind::Callout { .. }) => {
+                let mut grid = div().flex().flex_wrap().w(px(9. * 32.)).px(px(6.)).pb(px(6.));
+                for (i, e) in EMOJIS.iter().enumerate() {
+                    let hover = t.hover;
+                    grid = grid.child(
+                        div()
+                            .id(("callout-emoji", i))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(32.))
+                            .rounded(px(6.))
+                            .text_size(px(20.))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_callout_icon(ix, e, cx)))
+                            .child(*e),
+                    );
+                }
+                menu_surface(t).child(menu_label("Icon", t)).child(grid)
+            }
+            _ => return None,
+        };
+        Some(popover(
+            pos,
+            Corner::TopLeft,
+            menu,
+            cx.listener(|this, _, _, cx| {
+                this.picker = None;
+                cx.notify();
+            }),
+        ))
     }
 
     fn render_slash_menu(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -548,7 +895,7 @@ impl Editor {
                 menu_item("bm-dup", Some("copy"), "Duplicate", t)
                     .on_click(cx.listener(move |this, _, _, cx| this.duplicate_block(ix, cx))),
             );
-        if self.blocks[ix].kind.has_text() {
+        if self.blocks[ix].kind.has_text() && !self.blocks[ix].kind.is_raw() || matches!(self.blocks[ix].kind, BlockKind::Code { .. }) {
             menu = menu
                 .child(menu_separator(t))
                 .child(menu_label("Turn into", t));
@@ -596,7 +943,7 @@ impl Editor {
             || self.selecting
             || self.slash.is_some()
             || self.marked.is_some()
-            || matches!(self.cur().kind, BlockKind::Code { .. })
+            || self.cur().kind.is_raw()
         {
             return None;
         }
@@ -636,6 +983,38 @@ impl Editor {
                     .child(icon(name, 16., if active { t.accent } else { t.text })),
             );
         }
+        let hover = t.hover;
+        let has_link = self.link_at(self.sel.block, self.sel.range.start).is_some();
+        bar = bar.child(
+            div()
+                .id("fmt-link")
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(28.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .on_click(cx.listener(|this, _, window, cx| this.insert_link(&InsertLink, window, cx)))
+                .child(icon("link", 16., if has_link { t.accent } else { t.text })),
+        );
+        bar = bar.child(div().w(px(1.)).h(px(18.)).mx(px(3.)).bg(t.border)).child(
+            div()
+                .id("fmt-ai")
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .h(px(28.))
+                .px(px(8.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .hover(move |s| s.bg(hover))
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(EditorEvent::AskAi)))
+                .child(icon("sparkles", 15., t.accent))
+                .child("Ask AI"),
+        );
         Some(
             deferred(
                 anchored()
@@ -659,13 +1038,18 @@ impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let focused = self.focus.is_focused(window);
+        let scale = window.scale_factor();
         let vis = visibility(&self.blocks);
 
         // forget layouts of blocks that no longer exist
         {
             let ids: HashSet<u64> = self.blocks.iter().map(|b| b.id).collect();
             self.layouts.borrow_mut().retain(|id, _| ids.contains(id));
+            // hidden rows (inside collapsed toggles) must not keep stale bounds
+            let shown: HashSet<u64> = self.blocks.iter().zip(&vis).filter(|(_, v)| **v).map(|(b, _)| b.id).collect();
+            self.row_bounds.borrow_mut().retain(|id, _| shown.contains(id));
         }
+        self.clear_stale_drag(cx);
 
         let mut col = div()
             .id("editor")
@@ -713,6 +1097,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::move_block_up))
             .on_action(cx.listener(Self::move_block_down))
             .on_action(cx.listener(Self::duplicate))
+            .on_action(cx.listener(Self::insert_link))
             .on_action(cx.listener(|this, _: &Bold, _, cx| this.toggle_mark(MarkKind::Bold, cx)))
             .on_action(cx.listener(|this, _: &Italic, _, cx| this.toggle_mark(MarkKind::Italic, cx)))
             .on_action(cx.listener(|this, _: &Underline, _, cx| this.toggle_mark(MarkKind::Underline, cx)))
@@ -733,13 +1118,31 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &TurnCode, _, cx| {
                 this.turn_into(BlockKind::Code { lang: String::new() }, cx)
             }))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up));
+            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<DragBlock>, _, cx| {
+                let drag = ev.drag(cx).clone();
+                let pos = ev.event.position;
+                let inside = ev.bounds.contains(&pos) && this.scroll.bounds().contains(&pos);
+                this.drag_moved(&drag, pos, inside, cx);
+            }))
+            .on_drop(cx.listener(|this, drag: &DragBlock, _, cx| this.drop_dragged(drag, cx)))
+            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<ExternalPaths>, _, cx| {
+                let pos = ev.event.position;
+                let inside = ev.bounds.contains(&pos) && this.scroll.bounds().contains(&pos);
+                this.files_dragged(pos, inside, cx);
+            }))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.drop_files(paths.paths(), window, cx)
+            }))
+            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<ResizeImage>, _, cx| {
+                let drag = ev.drag(cx).clone();
+                let max = this.index_of_block(drag.id).map_or(PAGE_MAX_W, |ix| this.column_width(ix));
+                this.resize_moved(&drag, ev.event.position.x, max, cx);
+            }));
 
+        let last_vis = (0..self.blocks.len()).rev().find(|&i| vis[i]);
         for ix in 0..self.blocks.len() {
             if vis[ix] {
-                col = col.child(self.render_block(ix, focused, &t, cx));
+                col = col.child(self.render_block(ix, Some(ix) == last_vis, focused, scale, &t, cx));
             }
         }
 
@@ -752,12 +1155,37 @@ impl Render for Editor {
                 .cursor_text()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
+                    cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
                         cx.stop_propagation();
-                        this.click_below(window, cx);
+                        this.begin_marquee(ev.position, true, window, cx);
                     }),
                 ),
         );
+
+        // While selecting, follow the pointer anywhere in the window.
+        if self.tracking_pointer() {
+            let entity = cx.entity();
+            col = col.child(
+                canvas(|_, _, _| {}, move |_, _, window, _| {
+                    let e = entity.clone();
+                    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture {
+                            e.update(cx, |this, cx| this.on_mouse_move(ev, window, cx));
+                        }
+                    });
+                    let e = entity.clone();
+                    window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture && ev.button == MouseButton::Left {
+                            e.update(cx, |this, cx| this.on_mouse_up(ev, window, cx));
+                        }
+                    });
+                })
+                .absolute(),
+            );
+        }
+        if let Some(rect) = self.render_marquee(&t) {
+            col = col.child(rect);
+        }
 
         if let Some(menu) = self.render_slash_menu(&t, cx) {
             col = col.child(menu);
@@ -767,6 +1195,15 @@ impl Render for Editor {
         }
         if let Some(bar) = self.render_format_toolbar(focused, &t, cx) {
             col = col.child(bar);
+        }
+        if let Some(p) = self.render_link_editor(&t, cx) {
+            col = col.child(p);
+        }
+        if let Some(chip) = self.render_link_chip(focused, &t, cx) {
+            col = col.child(chip);
+        }
+        if let Some(p) = self.render_picker(&t, cx) {
+            col = col.child(p);
         }
         col
     }

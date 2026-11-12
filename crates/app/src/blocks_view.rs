@@ -25,14 +25,14 @@ pub fn metrics(kind: &BlockKind, base: f32) -> (f32, f32) {
         BlockKind::Heading(1) => (base * 1.875, (base * 1.875 * 1.3).round()),
         BlockKind::Heading(2) => (base * 1.5, (base * 1.5 * 1.3).round()),
         BlockKind::Heading(_) => (base * 1.25, (base * 1.25 * 1.3).round()),
-        BlockKind::Code { .. } => ((base * 0.85).round(), (base * 0.85 * 1.55).round()),
+        BlockKind::Code { .. } | BlockKind::Table => ((base * 0.85).round(), (base * 0.85 * 1.55).round()),
         _ => (base, (base * 1.5).round()),
     }
 }
 
 pub fn block_text(block: &Block, t: &Theme, base: f32) -> BlockText {
     let (font_size, line_height) = metrics(&block.kind, base);
-    let is_code_block = matches!(block.kind, BlockKind::Code { .. });
+    let is_code_block = block.kind.is_raw();
     let heading = matches!(block.kind, BlockKind::Heading(_));
     let done = matches!(block.kind, BlockKind::Todo { checked: true });
     let base_color = if done { t.text_faint } else { t.text };
@@ -125,9 +125,46 @@ pub fn top_margin(kind: &BlockKind, first: bool, base: f32) -> f32 {
         BlockKind::Heading(1) => 30.0 * k,
         BlockKind::Heading(2) => 22.0 * k,
         BlockKind::Heading(_) => 16.0 * k,
-        BlockKind::Callout { .. } | BlockKind::Code { .. } => 5.0 * k,
+        BlockKind::Callout { .. } | BlockKind::Code { .. } | BlockKind::Table => 5.0 * k,
         _ => 1.0,
     }
+}
+
+/// A Markdown table drawn as a grid (header row in bold).
+pub fn table_grid(src: &str, t: &Theme, base: f32) -> Div {
+    let rows = nota_core::markdown::table_rows(src);
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+    let mut grid = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .my(px(4.))
+        .border_1()
+        .border_color(t.border_strong)
+        .rounded(px(4.))
+        .overflow_hidden()
+        .text_size(px((base * 0.875).round()))
+        .line_height(px((base * 0.875 * 1.5).round()));
+    for (ri, r) in rows.iter().enumerate() {
+        let mut line = div().flex().w_full();
+        if ri > 0 {
+            line = line.border_t_1().border_color(t.border_strong);
+        }
+        if ri == 0 {
+            line = line.bg(t.hover).font_weight(FontWeight::SEMIBOLD);
+        }
+        for ci in 0..cols {
+            let cell = r.get(ci).map(|c| nota_core::markdown::inline_from_md(c).text).unwrap_or_default();
+            let mut c = div().flex_1().min_w_0().px(px(8.)).py(px(5.)).overflow_hidden().child(SharedString::from(cell));
+            if ci > 0 {
+                c = c.border_l_1().border_color(t.border_strong);
+            }
+            line = line.child(c);
+        }
+        grid = grid.child(line);
+    }
+    grid
 }
 
 /// The fixed-width marker column for list-like blocks.
@@ -240,9 +277,15 @@ fn static_block(blocks: &[Block], ix: usize, t: &Theme, base: f32) -> AnyElement
                     .child(text),
             )
             .into_any_element(),
+        BlockKind::Table => row.child(table_grid(&block.text.text, t, base)).into_any_element(),
         BlockKind::PageLink { .. } => row
             .child(icon("page", 16., t.text_muted))
             .child(div().pl(px(6.)).child(bt.text))
+            .into_any_element(),
+        BlockKind::Image { src, .. } => row
+            .text_color(t.text_muted)
+            .child(icon("image", 16., t.text_muted))
+            .child(div().pl(px(6.)).child(SharedString::from(src.clone())))
             .into_any_element(),
         _ => row.child(text).into_any_element(),
     }

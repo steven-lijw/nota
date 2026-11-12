@@ -17,6 +17,9 @@ use nota_core::{PropKind, PropValue};
 
 pub enum PageEvent {
     Open(String),
+    /// Show a database row in the side peek.
+    Peek(String),
+    AskAi,
 }
 
 pub struct PageView {
@@ -70,7 +73,15 @@ impl PageView {
                 }
                 _ => {}
             }),
-            cx.subscribe(&store, |this: &mut Self, _, _: &StoreEvent, cx| {
+            cx.subscribe(&store, |this: &mut Self, _, ev: &StoreEvent, cx| {
+                if let StoreEvent::BlocksChanged(id) = ev {
+                    if *id == this.page_id {
+                        if let Some(editor) = &this.editor {
+                            editor.update(cx, |e, cx| e.reload_blocks(cx));
+                        }
+                    }
+                    return;
+                }
                 let text = this.store.read(cx).page(&this.page_id).map(|p| p.title.clone()).unwrap_or_default();
                 this.title.update(cx, |t, cx| {
                     if t.text() != text {
@@ -87,8 +98,10 @@ impl PageView {
         if is_db {
             let view = cx.new(|cx| DatabaseView::new(store.clone(), page_id.clone(), window, cx));
             subs.push(cx.subscribe(&view, |_, _, ev: &DbEvent, cx| {
-                let DbEvent::Open(id) = ev;
-                cx.emit(PageEvent::Open(id.clone()))
+                match ev {
+                    DbEvent::Open(id) => cx.emit(PageEvent::Open(id.clone())),
+                    DbEvent::Peek(id) => cx.emit(PageEvent::Peek(id.clone())),
+                }
             }));
             db = Some(view);
         } else {
@@ -104,6 +117,7 @@ impl PageView {
                     this.title.update(cx, |t, cx| t.move_to_end(cx));
                     this.title.read(cx).focus(window);
                 }
+                EditorEvent::AskAi => cx.emit(PageEvent::AskAi),
             }));
             editor = Some(ed);
         }
@@ -122,6 +136,29 @@ impl PageView {
             _cell_sub: None,
             _subs: subs,
         }
+    }
+
+    /// Called when a kept-alive view is shown again: pick up anything that
+    /// changed in the store while it was hidden.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        let (title, blocks) = {
+            let s = self.store.read(cx);
+            let p = s.page(&self.page_id);
+            (p.map(|p| p.title.clone()).unwrap_or_default(), p.map(|p| p.blocks.clone()))
+        };
+        self.title.update(cx, |t, cx| {
+            if t.text() != title {
+                t.set_text(title, cx)
+            }
+        });
+        if let (Some(editor), Some(blocks)) = (&self.editor, blocks) {
+            let stale = editor.read(cx).blocks != blocks && !blocks.is_empty();
+            if stale {
+                editor.update(cx, |e, cx| e.reload_blocks(cx));
+            }
+        }
+        self.icon_picker = None;
+        cx.notify();
     }
 
     fn set_icon(&mut self, icon: Option<String>, cx: &mut Context<Self>) {
@@ -211,6 +248,44 @@ impl Render for PageView {
         };
         let is_db = page.is_database();
         let hover = t.hover;
+
+        // A file Nota could not read is shown as it is, read-only.
+        if let Some(err) = &page.load_error {
+            let file = page.file.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
+            return div()
+                .id("page-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .child(
+                    div().flex().justify_center().w_full().child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(14.))
+                            .w_full()
+                            .max_w(px(PAGE_MAX_W))
+                            .pt(px(48.))
+                            .pb(px(80.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .p(px(12.))
+                                    .rounded(px(8.))
+                                    .bg(t.callout_bg)
+                                    .text_size(px(14.))
+                                    .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("Nota couldn't read {file}")))
+                                    .child(div().text_color(t.text_muted).child(SharedString::from(err.clone())))
+                                    .child(div().text_color(t.text_muted).child(
+                                        "It is shown read-only and won't be changed. Fix the file in a text editor, then use Settings → Reload from disk.",
+                                    )),
+                            )
+                            .child(crate::blocks_view::static_blocks(&page.blocks, &t, 16.)),
+                    ),
+                )
+                .into_any_element();
+        }
 
         // --- icon + title ---------------------------------------------------
         let mut head = div().group("page-head").flex().flex_col();
@@ -381,7 +456,25 @@ impl Render for PageView {
             if let Some(editor) = &self.editor {
                 inner = inner.child(div().flex().flex_col().w_full().pt(px(4.)).child(editor.clone()));
             }
-            column = column.child(div().flex().justify_center().w_full().child(inner));
+            // The empty margins beside the text start a block selection rectangle.
+            let margin = |id: &'static str| {
+                div().id(id).flex_1().min_w_0().on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
+                        if let Some(editor) = &this.editor {
+                            editor.update(cx, |e, cx| e.begin_marquee(ev.position, false, window, cx));
+                        }
+                    }),
+                )
+            };
+            column = column.child(
+                div()
+                    .flex()
+                    .w_full()
+                    .child(margin("page-margin-left"))
+                    .child(inner.min_w_0())
+                    .child(margin("page-margin-right")),
+            );
         }
 
         let mut root = div()

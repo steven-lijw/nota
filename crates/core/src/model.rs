@@ -33,12 +33,23 @@ pub enum BlockKind {
     Code { lang: String },
     /// Link to a sub-page; `text` caches the page title.
     PageLink { page: String },
+    /// An image file; `text` holds the alt text. `src` is relative to the
+    /// page's file (normally `assets/…`), `width` is the display width in
+    /// points (`None`: natural size, at most the column width).
+    Image { src: String, width: Option<u32> },
+    /// A Markdown (GFM) table, kept as its source text.
+    Table,
 }
 
 impl BlockKind {
     /// Whether the block holds editable text.
     pub fn has_text(&self) -> bool {
-        !matches!(self, BlockKind::Divider | BlockKind::PageLink { .. })
+        !matches!(self, BlockKind::Divider | BlockKind::PageLink { .. } | BlockKind::Image { .. })
+    }
+
+    /// Text that is kept verbatim: no inline formatting or Markdown shortcuts.
+    pub fn is_raw(&self) -> bool {
+        matches!(self, BlockKind::Code { .. } | BlockKind::Table)
     }
 
     pub fn is_list(&self) -> bool {
@@ -63,6 +74,8 @@ impl BlockKind {
             BlockKind::Divider => "Divider",
             BlockKind::Code { .. } => "Code",
             BlockKind::PageLink { .. } => "Page",
+            BlockKind::Image { .. } => "Image",
+            BlockKind::Table => "Table",
         }
     }
 }
@@ -123,6 +136,70 @@ pub fn subtree_end(blocks: &[Block], ix: usize) -> usize {
         end += 1;
     }
     end
+}
+
+/// Grow a block range so it ends after the subtree of every block in it.
+pub fn expand_to_subtrees(blocks: &[Block], range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let mut end = range.end.min(blocks.len());
+    for ix in range.start..end.min(blocks.len()) {
+        end = end.max(subtree_end(blocks, ix));
+    }
+    range.start..end
+}
+
+/// The indents a block range may take when dropped into `gap` (an insert
+/// position in the unmodified `blocks`): at least the indent of the block
+/// that will follow it (so it never adopts the next block's parent's
+/// children) and at most one deeper than the block above.
+pub fn drop_indent_range(blocks: &[Block], moving: std::ops::Range<usize>, gap: usize) -> (u8, u8) {
+    let prev = (0..gap).rev().find(|i| !moving.contains(i));
+    let next = (gap..blocks.len()).find(|i| !moving.contains(i));
+    let max = match prev {
+        None => 0,
+        Some(p) => {
+            let closed = matches!(blocks[p].kind, BlockKind::Toggle { open: false });
+            // a collapsed toggle hides its children: drop next to it instead
+            blocks[p].indent + if closed { 0 } else { 1 }
+        }
+    };
+    let min = next.map_or(0, |n| blocks[n].indent).min(max);
+    (min, max)
+}
+
+/// Move `range` so it starts at `gap` (an index into the unmodified vector)
+/// with its first block at `indent`; the rest keep their relative depth.
+/// Returns where the blocks ended up, or `None` if the move is a no-op or
+/// would put the range inside itself.
+pub fn move_blocks(
+    blocks: &mut Vec<Block>,
+    range: std::ops::Range<usize>,
+    gap: usize,
+    indent: u8,
+) -> Option<std::ops::Range<usize>> {
+    if range.is_empty() || range.end > blocks.len() || gap > blocks.len() {
+        return None;
+    }
+    if gap > range.start && gap < range.end {
+        return None;
+    }
+    let base = blocks[range.start..range.end].iter().map(|b| b.indent).min().unwrap_or(0);
+    let first = blocks[range.start].indent;
+    let unchanged_place = gap == range.start || gap == range.end;
+    if unchanged_place && first == indent {
+        return None;
+    }
+    let len = range.len();
+    let mut moved: Vec<Block> = blocks.drain(range.clone()).collect();
+    // Shift the whole range so its first block lands on `indent`.
+    let shift = indent as i32 - first as i32;
+    for b in &mut moved {
+        let d = (b.indent as i32 - base as i32) + (base as i32 + shift);
+        b.indent = d.max(0) as u8;
+    }
+    let at = if gap >= range.end { gap - len } else { gap };
+    blocks.splice(at..at, moved);
+    normalize_indents(blocks);
+    Some(at..at + len)
 }
 
 /// For each block, whether it is visible (not inside a collapsed toggle).
@@ -586,6 +663,12 @@ pub struct Page {
     pub blocks: Vec<Block>,
     /// Path relative to the vault root, once the page has been written or loaded.
     pub file: Option<std::path::PathBuf>,
+    /// Modification time of the file when it was last read or written, to
+    /// notice changes made by other programs (or the AI).
+    pub disk_mtime: Option<std::time::SystemTime>,
+    /// Set when the file could not be understood (e.g. broken front matter):
+    /// such pages are shown read-only and never written back.
+    pub load_error: Option<String>,
 }
 
 impl Page {
@@ -610,6 +693,8 @@ impl Page {
             },
             blocks: vec![Block::paragraph("")],
             file: None,
+            disk_mtime: None,
+            load_error: None,
         }
     }
 
@@ -665,5 +750,80 @@ mod tests {
         );
         assert_eq!(subtree_end(&blocks, 0), 2);
         assert_eq!(subtree_end(&blocks, 3), 5);
+    }
+
+    fn shape(blocks: &[Block]) -> Vec<(String, u8)> {
+        blocks.iter().map(|b| (b.text.text.clone(), b.indent)).collect()
+    }
+
+    fn sample() -> Vec<Block> {
+        vec![
+            Block::paragraph("a"),
+            Block::new(BlockKind::Bullet, "b"),
+            Block::new(BlockKind::Bullet, "b1").with_indent(1),
+            Block::new(BlockKind::Bullet, "b2").with_indent(1),
+            Block::paragraph("c"),
+        ]
+    }
+
+    #[test]
+    fn move_down_and_up() {
+        let mut v = sample();
+        // move "a" to the very end
+        let r = move_blocks(&mut v, 0..1, 5, 0).unwrap();
+        assert_eq!(r, 4..5);
+        assert_eq!(shape(&v)[4], ("a".into(), 0));
+        // move "c" (now at 3) to the top
+        let r = move_blocks(&mut v, 3..4, 0, 0).unwrap();
+        assert_eq!(r, 0..1);
+        assert_eq!(v[0].text.text, "c");
+    }
+
+    #[test]
+    fn move_subtree_keeps_children() {
+        let mut v = sample();
+        let range = expand_to_subtrees(&v, 1..2);
+        assert_eq!(range, 1..4);
+        move_blocks(&mut v, range, 0, 0).unwrap();
+        assert_eq!(
+            shape(&v),
+            vec![("b".into(), 0), ("b1".into(), 1), ("b2".into(), 1), ("a".into(), 0), ("c".into(), 0)]
+        );
+    }
+
+    #[test]
+    fn nest_by_indent_and_noops() {
+        let mut v = sample();
+        // same place, same indent: nothing happens
+        assert!(move_blocks(&mut v, 4..5, 4, 0).is_none());
+        assert!(move_blocks(&mut v, 4..5, 5, 0).is_none());
+        // into itself
+        assert!(move_blocks(&mut v, 1..4, 2, 0).is_none());
+        // same place, deeper: becomes a child of b2's parent level
+        let r = move_blocks(&mut v, 4..5, 4, 1).unwrap();
+        assert_eq!(r, 4..5);
+        assert_eq!(v[4].indent, 1);
+    }
+
+    #[test]
+    fn drop_indent_limits() {
+        let v = sample();
+        // between b and b1: must become b's first child
+        assert_eq!(drop_indent_range(&v, 4..5, 2), (1, 1));
+        // after b2, before c: anywhere from top level to under b2
+        assert_eq!(drop_indent_range(&v, 0..1, 4), (0, 2));
+        // top of the page
+        assert_eq!(drop_indent_range(&v, 4..5, 0), (0, 0));
+        // a collapsed toggle does not take children
+        let t = vec![Block::new(BlockKind::Toggle { open: false }, "t"), Block::paragraph("x")];
+        assert_eq!(drop_indent_range(&t, 1..2, 1), (0, 0));
+    }
+
+    #[test]
+    fn move_selection_with_mixed_depths() {
+        let mut v = sample();
+        // b1, b2 (indent 1) moved to the top become top-level
+        move_blocks(&mut v, 2..4, 0, 0).unwrap();
+        assert_eq!(shape(&v)[..2], [("b1".into(), 0), ("b2".into(), 0)]);
     }
 }

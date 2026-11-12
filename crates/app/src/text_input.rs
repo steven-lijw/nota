@@ -43,6 +43,10 @@ pub struct TextInput {
     /// Shift-Enter (or Enter when `enter_newline`) inserts a line break.
     pub multiline: bool,
     pub enter_newline: bool,
+    /// (text, selection) before each edit, for ⌘Z / ⇧⌘Z.
+    undo: Vec<(String, Range<usize>)>,
+    redo: Vec<(String, Range<usize>)>,
+    last_edit: Option<std::time::Instant>,
     _subs: Vec<Subscription>,
 }
 
@@ -72,6 +76,9 @@ impl TextInput {
             color: None,
             multiline: false,
             enter_newline: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            last_edit: None,
             _subs: subs,
         }
     }
@@ -81,7 +88,13 @@ impl TextInput {
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
-        self.text = text.into();
+        let text = text.into();
+        if text != self.text {
+            self.undo.clear();
+            self.redo.clear();
+            self.last_edit = None;
+        }
+        self.text = text;
         self.sel = self.text.len()..self.text.len();
         self.reversed = false;
         self.marked = None;
@@ -136,7 +149,47 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Remember the state before an edit; quick successive keystrokes share one step.
+    fn snapshot(&mut self) {
+        let now = std::time::Instant::now();
+        let recent = self.last_edit.is_some_and(|t| now.duration_since(t).as_millis() < 900);
+        if !recent || self.undo.is_empty() {
+            self.undo.push((self.text.clone(), self.sel.clone()));
+            if self.undo.len() > 200 {
+                self.undo.remove(0);
+            }
+        }
+        self.redo.clear();
+        self.last_edit = Some(now);
+    }
+
+    fn restore(&mut self, (text, sel): (String, Range<usize>), cx: &mut Context<Self>) {
+        self.text = text;
+        let len = self.text.len();
+        self.sel = clamp(&self.text, sel.start.min(len))..clamp(&self.text, sel.end.min(len));
+        self.reversed = false;
+        self.marked = None;
+        self.last_edit = None;
+        cx.emit(InputEvent::Changed);
+        cx.notify();
+    }
+
+    fn undo_edit(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.undo.pop() {
+            self.redo.push((self.text.clone(), self.sel.clone()));
+            self.restore(state, cx);
+        }
+    }
+
+    fn redo_edit(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.redo.pop() {
+            self.undo.push((self.text.clone(), self.sel.clone()));
+            self.restore(state, cx);
+        }
+    }
+
     fn replace_selection(&mut self, new_text: &str, cx: &mut Context<Self>) {
+        self.snapshot();
         let range = self.sel.clone();
         self.text.replace_range(range.clone(), new_text);
         let at = range.start + new_text.len();
@@ -434,6 +487,9 @@ impl EntityInputHandler for TextInput {
         } else {
             new_text.replace('\n', " ")
         };
+        if self.marked.is_none() {
+            self.snapshot();
+        }
         self.text.replace_range(range.clone(), &new_text);
         let at = range.start + new_text.len();
         self.sel = at..at;
@@ -456,6 +512,9 @@ impl EntityInputHandler for TextInput {
             .map(|r| range_from_utf16(&self.text, r))
             .or(self.marked.clone())
             .unwrap_or(self.sel.clone());
+        if self.marked.is_none() {
+            self.snapshot(); // an IME composition starts
+        }
         self.text.replace_range(range.clone(), new_text);
         self.marked = if new_text.is_empty() {
             None
@@ -580,6 +639,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::enter))
             .on_action(cx.listener(Self::shift_enter))
             .on_action(cx.listener(Self::escape))
+            .on_action(cx.listener(Self::undo_edit))
+            .on_action(cx.listener(Self::redo_edit))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

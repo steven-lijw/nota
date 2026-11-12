@@ -16,6 +16,7 @@ mod text_input;
 mod text_view;
 mod theme;
 mod ui;
+mod update;
 mod workspace;
 
 use gpui::{
@@ -89,6 +90,8 @@ fn main() {
             Menu {
                 name: "Nota".into(),
                 items: vec![
+                    MenuItem::action("Check for Updates…", actions::CheckForUpdates),
+                    MenuItem::separator(),
                     MenuItem::action("Toggle Dark Mode", actions::ToggleTheme),
                     MenuItem::separator(),
                     MenuItem::action("Quit Nota", actions::Quit),
@@ -132,6 +135,7 @@ fn main() {
         .detach();
 
         let store = cx.new(|cx| store::Store::new(vault, cx));
+        let updater = cx.new(update::Updater::new);
         cx.set_global(theme::Theme::get(store.read(cx).state.dark));
         let bounds = Bounds::centered(None, size(px(1320.), px(860.)), cx);
         let opened = cx.open_window(
@@ -145,7 +149,7 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| workspace::Workspace::new(store.clone(), window, cx)),
+            |window, cx| cx.new(|cx| workspace::Workspace::new(store.clone(), updater.clone(), window, cx)),
         );
         if let Err(err) = opened {
             eprintln!("Nota could not open a window: {err:#}");

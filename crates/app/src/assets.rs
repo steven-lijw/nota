@@ -27,6 +27,7 @@ const ICONS: &[(&str, &str)] = &[
     ("table", r#"<rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M2.5 6.5h11M6.5 6.5V13"/>"#),
     ("board", r#"<rect x="2.5" y="3" width="3" height="10" rx=".75"/><rect x="6.5" y="3" width="3" height="6.5" rx=".75"/><rect x="10.5" y="3" width="3" height="8.5" rx=".75"/>"#),
     ("list", r#"<path d="M6 4.5h7.5M6 8h7.5M6 11.5h7.5"/><g fill="black" stroke="none"><circle cx="3" cy="4.5" r=".9"/><circle cx="3" cy="8" r=".9"/><circle cx="3" cy="11.5" r=".9"/></g>"#),
+    ("image", r#"<rect x="2" y="2.5" width="12" height="11" rx="1.5"/><circle cx="5.75" cy="6" r="1.25"/><path d="M2.5 12l3.5-3.5 2.5 2.5 2-2 3 3"/>"#),
     ("gallery", r#"<rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1"/><rect x="9" y="9" width="4.5" height="4.5" rx="1"/>"#),
     ("calendar", r#"<rect x="2.5" y="3.5" width="11" height="9.5" rx="1.5"/><path d="M2.5 6.75h11M5.5 2v2.5M10.5 2v2.5"/>"#),
     ("sparkle", r#"<path d="M8 1.5C8.4 5 9.5 7 14.5 8 9.5 9 8.4 11 8 14.5 7.6 11 6.5 9 1.5 8 6.5 7 7.6 5 8 1.5Z" fill="black" stroke="none"/>"#),

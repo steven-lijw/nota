@@ -4,17 +4,19 @@
 use crate::actions::*;
 use crate::edit::*;
 use crate::store::Store;
+use gpui::AppContext;
 use crate::text_view::TextLayout;
 use gpui::{
-    px, App, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, EventEmitter,
+    point, px, App, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, ScrollHandle, Subscription, UTF16Selection, Window,
+    Point, ScrollHandle, Subscription, Task, UTF16Selection, Window,
 };
 use nota_core::markdown::{from_markdown, to_markdown};
 use nota_core::{
-    normalize_indents, subtree_end, visibility, Block, BlockKind, MarkKind, Marks, PageKind,
-    RichText,
+    drop_indent_range, expand_to_subtrees, move_blocks, normalize_indents, subtree_end, visibility,
+    Block, BlockKind, MarkKind, Marks, PageKind, RichText,
 };
+use std::time::Duration;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -26,6 +28,8 @@ pub enum EditorEvent {
     OpenPage(String),
     /// Arrow-up from the very first block.
     FocusTitle,
+    /// "Ask AI" on the selection toolbar.
+    AskAi,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -69,6 +73,7 @@ pub enum SlashAction {
     Turn(BlockKind),
     Page,
     Database,
+    Image,
 }
 
 pub struct SlashItem {
@@ -102,6 +107,7 @@ pub fn slash_items() -> Vec<SlashItem> {
         item("Quote", "\"", "quote", "quote blockquote 引用 yinyong", SlashAction::Turn(Quote)),
         item("Divider", "---", "divider", "divider line hr 分割线 fengexian", SlashAction::Turn(Divider)),
         item("Code", "```", "code", "code snippet 代码 daima", SlashAction::Turn(Code { lang: String::new() })),
+        item("Image", "", "image", "image picture photo screenshot 图片 截图 tupian", SlashAction::Image),
         item("Database", "", "database", "database table board 数据库 表格 看板 shujuku", SlashAction::Database),
     ]
 }
@@ -120,9 +126,117 @@ pub struct BlockMenu {
 
 #[derive(Clone)]
 pub struct DragBlock {
-    pub ix: usize,
+    /// Runtime id of the block whose handle was grabbed.
+    pub id: u64,
     pub label: String,
+    /// How many blocks move (the block selection, if the grabbed block is in it).
+    pub count: usize,
 }
+
+/// Where dragged blocks would land: before `gap` (an index into `blocks`,
+/// `blocks.len()` for the end) with the first block at `indent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DropTarget {
+    pub gap: usize,
+    pub indent: u8,
+}
+
+/// Rubber-band selection started in empty space.
+pub struct Marquee {
+    /// Start point in content coordinates (window point minus scroll offset).
+    pub start: Point<Pixels>,
+    /// Current pointer position in window coordinates.
+    pub current: Point<Pixels>,
+    /// Becomes true once the pointer moved far enough to count as a drag.
+    pub active: bool,
+    /// Started below the last block: a plain click there adds a line.
+    pub from_tail: bool,
+}
+
+/// The part of the page a question to Nota AI was about.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AiTarget {
+    /// Selected text inside one block.
+    Text { block: u64, range: Range<usize> },
+    /// Whole selected blocks (first and last, by runtime id).
+    Blocks { first: u64, last: u64 },
+}
+
+/// What the AI panel shows and sends for the current selection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AiSelection {
+    pub markdown: String,
+    pub preview: String,
+    pub target: AiTarget,
+}
+
+/// Dragging one of an image's side handles.
+#[derive(Clone)]
+pub struct ResizeImage {
+    pub id: u64,
+    /// -1 for the left handle, 1 for the right one.
+    pub side: f32,
+}
+
+/// Image file types that can be dropped or pasted into a page.
+pub const IMAGE_EXTS: [&str; 9] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tif", "tiff"];
+
+pub fn is_image_path(p: &std::path::Path) -> bool {
+    p.extension().is_some_and(|e| IMAGE_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
+}
+
+/// Languages offered for code blocks (stored as written here, lower-case).
+pub const CODE_LANGS: [&str; 22] = [
+    "", "bash", "c", "cpp", "csharp", "css", "go", "html", "java", "javascript", "json", "kotlin",
+    "markdown", "php", "python", "ruby", "rust", "sql", "swift", "typescript", "yaml", "toml",
+];
+
+pub fn lang_label(lang: &str) -> &str {
+    match lang {
+        "" => "Plain text",
+        "bash" | "sh" | "shell" | "zsh" => "Shell",
+        "c" => "C",
+        "cpp" | "c++" => "C++",
+        "csharp" | "cs" => "C#",
+        "css" => "CSS",
+        "go" => "Go",
+        "html" => "HTML",
+        "java" => "Java",
+        "javascript" | "js" => "JavaScript",
+        "json" => "JSON",
+        "kotlin" => "Kotlin",
+        "markdown" | "md" => "Markdown",
+        "php" => "PHP",
+        "python" | "py" => "Python",
+        "ruby" | "rb" => "Ruby",
+        "rust" | "rs" => "Rust",
+        "sql" => "SQL",
+        "swift" => "Swift",
+        "typescript" | "ts" => "TypeScript",
+        "yaml" | "yml" => "YAML",
+        "toml" => "TOML",
+        other => other,
+    }
+}
+
+/// The ⌘K link editor.
+pub struct LinkEdit {
+    pub block: usize,
+    pub range: Range<usize>,
+    pub input: Entity<crate::text_input::TextInput>,
+    pub had_link: bool,
+    _sub: Subscription,
+}
+
+/// Small pickers attached to one block.
+#[derive(Clone, Copy, PartialEq)]
+pub enum BlockPicker {
+    Language,
+    CalloutIcon,
+}
+
+pub const INDENT_PX: f32 = 24.0;
+const GUTTER_PX: f32 = 50.0;
 
 pub struct Editor {
     pub(crate) store: Entity<Store>,
@@ -145,6 +259,22 @@ pub struct Editor {
     last_edit: Option<(Instant, EditKind, usize)>,
     pub(crate) scroll: ScrollHandle,
     pub(crate) scroll_pending: bool,
+    /// Window bounds of every rendered block row, by block id.
+    pub(crate) row_bounds: Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>,
+    pub(crate) drop_target: Option<DropTarget>,
+    /// Blocks being dragged (dimmed while the drag lasts).
+    pub(crate) drag_range: Option<Range<usize>>,
+    pub(crate) marquee: Option<Marquee>,
+    pub(crate) link_edit: Option<LinkEdit>,
+    /// (block, picker, where it opens)
+    pub(crate) picker: Option<(usize, BlockPicker, Point<Pixels>)>,
+    last_mouse: Option<Point<Pixels>>,
+    /// Image natural sizes in pixels, by file.
+    pub(crate) image_dims: RefCell<HashMap<std::path::PathBuf, Option<(u32, u32)>>>,
+    /// (image block id, pointer x and width when the resize started)
+    resize_start: Option<(u64, Pixels, f32)>,
+    autoscrolling: bool,
+    _autoscroll: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
 
@@ -201,6 +331,17 @@ impl Editor {
             last_edit: None,
             scroll,
             scroll_pending: false,
+            row_bounds: Rc::new(RefCell::new(HashMap::new())),
+            drop_target: None,
+            drag_range: None,
+            marquee: None,
+            link_edit: None,
+            picker: None,
+            last_mouse: None,
+            image_dims: RefCell::new(HashMap::new()),
+            resize_start: None,
+            autoscrolling: false,
+            _autoscroll: None,
             _subs: subs,
         };
         editor.fix_selection();
@@ -407,6 +548,123 @@ impl Editor {
     fn close_popups(&mut self) {
         self.slash = None;
         self.block_menu = None;
+        self.link_edit = None;
+        self.picker = None;
+    }
+
+    // ----------------------------------------------------------------------
+    // links and block pickers
+    // ----------------------------------------------------------------------
+
+    /// The link around `offset` in block `ix`: its range and URL.
+    pub(crate) fn link_at(&self, ix: usize, offset: usize) -> Option<(Range<usize>, String)> {
+        let text = &self.blocks.get(ix)?.text;
+        // merge neighbouring runs that carry the same link
+        let mut links: Vec<(Range<usize>, String)> = Vec::new();
+        for (r, m) in text.segments() {
+            let Some(url) = &m.link else { continue };
+            match links.last_mut() {
+                Some((lr, lu)) if lr.end == r.start && lu == url => lr.end = r.end,
+                _ => links.push((r.clone(), url.clone())),
+            }
+        }
+        links.into_iter().find(|(r, _)| !r.is_empty() && r.start <= offset && offset <= r.end)
+    }
+
+    pub(crate) fn insert_link(&mut self, _: &InsertLink, window: &mut Window, cx: &mut Context<Self>) {
+        if self.block_sel.is_some() || !self.cur().kind.has_text() || self.cur().kind.is_raw() {
+            cx.propagate();
+            return;
+        }
+        let ix = self.sel.block;
+        let (range, url) = if self.sel.range.is_empty() {
+            match self.link_at(ix, self.cursor()) {
+                Some(found) => found,
+                None => {
+                    cx.propagate(); // nothing to link: ⌘K searches
+                    return;
+                }
+            }
+        } else {
+            let r = self.sel.range.clone();
+            let url = self.link_at(ix, r.start).filter(|(lr, _)| lr.start <= r.start && r.end <= lr.end).map(|l| l.1);
+            (r, url.unwrap_or_default())
+        };
+        self.open_link_editor(ix, range, url, window, cx);
+    }
+
+    pub(crate) fn open_link_editor(&mut self, ix: usize, range: Range<usize>, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::text_input::{InputEvent, TextInput};
+        let had_link = !url.is_empty();
+        let input = cx.new(|cx| {
+            let mut i = TextInput::new(window, cx);
+            i.placeholder = "Paste or type a link…".into();
+            i.set_text(url, cx);
+            i.select_all_text(cx);
+            i
+        });
+        input.read(cx).focus(window);
+        let sub = cx.subscribe_in(&input, window, |this: &mut Self, _, ev: &InputEvent, window, cx| match ev {
+            InputEvent::Submit => this.apply_link(window, cx),
+            InputEvent::Cancel => {
+                this.link_edit = None;
+                window.focus(&this.focus);
+                cx.notify();
+            }
+            _ => {}
+        });
+        self.sel = Sel { block: ix, range: range.clone(), reversed: false };
+        self.link_edit = Some(LinkEdit { block: ix, range, input, had_link, _sub: sub });
+        cx.notify();
+    }
+
+    /// Apply the URL typed in the link editor (empty removes the link).
+    pub(crate) fn apply_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.link_edit.take() else { return };
+        let url = edit.input.read(cx).text().trim().to_string();
+        if edit.block < self.blocks.len() {
+            let len = self.blocks[edit.block].text.len();
+            let r = edit.range.start.min(len)..edit.range.end.min(len);
+            self.checkpoint(EditKind::Other);
+            let url = (!url.is_empty()).then(|| {
+                if url.contains("://") || url.starts_with("mailto:") { url } else { format!("https://{url}") }
+            });
+            self.blocks[edit.block].text.set_link(r.clone(), url);
+            self.sel = Sel::caret(edit.block, r.end);
+            self.after_edit(cx);
+        }
+        window.focus(&self.focus);
+    }
+
+    pub(crate) fn remove_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(edit) = &self.link_edit {
+            edit.input.update(cx, |i, cx| i.set_text("", cx));
+        }
+        self.apply_link(window, cx);
+    }
+
+    pub(crate) fn set_code_lang(&mut self, ix: usize, lang: &str, cx: &mut Context<Self>) {
+        self.picker = None;
+        if let Some(BlockKind::Code { lang: l }) = self.blocks.get_mut(ix).map(|b| &mut b.kind) {
+            if l != lang {
+                *l = lang.to_string();
+                self.checkpoint(EditKind::Other);
+                self.after_edit(cx);
+                return;
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_callout_icon(&mut self, ix: usize, emoji: &str, cx: &mut Context<Self>) {
+        self.picker = None;
+        if let Some(BlockKind::Callout { icon }) = self.blocks.get_mut(ix).map(|b| &mut b.kind) {
+            *icon = emoji.to_string();
+            self.checkpoint(EditKind::Other);
+            self.after_edit(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     // ----------------------------------------------------------------------
@@ -419,7 +677,7 @@ impl Editor {
         }
         self.checkpoint(EditKind::Typing);
         let ix = self.sel.block;
-        let is_code = matches!(self.blocks[ix].kind, BlockKind::Code { .. });
+        let is_code = self.blocks[ix].kind.is_raw();
         let marks = if is_code {
             Some(Marks::default())
         } else if range.is_empty() {
@@ -657,6 +915,24 @@ impl Editor {
                 }
                 self.after_edit(cx);
             }
+            SlashAction::Image => {
+                self.after_edit(cx);
+                let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: true,
+                    prompt: Some("Insert".into()),
+                });
+                cx.spawn_in(window, async move |this, cx| {
+                    let Ok(Ok(Some(paths))) = paths.await else { return };
+                    this.update_in(cx, |this, window, cx| {
+                        this.drop_target = None;
+                        this.drop_files(&paths, window, cx)
+                    })
+                    .ok();
+                })
+                .detach();
+            }
             SlashAction::Page | SlashAction::Database => {
                 let kind = if matches!(item.action, SlashAction::Database) {
                     PageKind::Database
@@ -692,6 +968,8 @@ impl Editor {
         let Some(range) = self.block_sel_range() else {
             return false;
         };
+        // children go with their parent
+        let range = expand_to_subtrees(&self.blocks, range);
         self.checkpoint(EditKind::Other);
         let indent = self.blocks[range.start].indent;
         self.blocks.drain(range.clone());
@@ -725,7 +1003,7 @@ impl Editor {
             if !block.kind.has_text() {
                 continue;
             }
-            if matches!(kind, BlockKind::Code { .. }) {
+            if kind.is_raw() {
                 block.text.clear_marks();
             }
             if kind == BlockKind::Divider {
@@ -760,34 +1038,396 @@ impl Editor {
         self.after_edit(cx);
     }
 
-    /// Move the subtree at `from` so that it sits right after the subtree at `to`.
-    pub(crate) fn move_block_after(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        if from >= self.blocks.len() || to >= self.blocks.len() {
-            return;
+    // ----------------------------------------------------------------------
+    // dragging blocks
+    // ----------------------------------------------------------------------
+
+    /// The blocks that move when the handle of block `ix` is dragged: the
+    /// whole block selection if `ix` is part of it, else `ix` and its children.
+    pub(crate) fn moving_range(&self, ix: usize) -> Range<usize> {
+        match self.block_sel_range() {
+            Some(r) if r.contains(&ix) => expand_to_subtrees(&self.blocks, r),
+            _ => ix..subtree_end(&self.blocks, ix),
         }
-        let from_end = subtree_end(&self.blocks, from);
-        if to >= from && to < from_end {
-            return;
+    }
+
+    fn index_of(&self, id: u64) -> Option<usize> {
+        self.blocks.iter().position(|b| b.id == id)
+    }
+
+    pub(crate) fn index_of_block(&self, id: u64) -> Option<usize> {
+        self.index_of(id)
+    }
+
+    /// Visible blocks that have been laid out, with their row bounds, top to bottom.
+    fn visible_rows(&self) -> Vec<(usize, Bounds<Pixels>)> {
+        let vis = visibility(&self.blocks);
+        let rows = self.row_bounds.borrow();
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| vis[*i])
+            .filter_map(|(i, b)| rows.get(&b.id).map(|r| (i, *r)))
+            .collect()
+    }
+
+    /// Left edge of a block's content (where its text or marker starts).
+    fn content_left(&self, ix: usize, row: &Bounds<Pixels>) -> Pixels {
+        row.left() + px(GUTTER_PX + self.blocks[ix].indent as f32 * INDENT_PX)
+    }
+
+    /// Work out where the dragged blocks would land for a pointer position.
+    fn drop_target_at(&self, pos: Point<Pixels>, moving: &Range<usize>) -> Option<DropTarget> {
+        let rows = self.visible_rows();
+        if rows.is_empty() {
+            return None;
         }
+        let gap = rows
+            .iter()
+            .find(|(_, b)| pos.y < b.center().y)
+            .map_or(self.blocks.len(), |(i, _)| *i);
+        if gap > moving.start && gap < moving.end {
+            return None;
+        }
+        let (min, max) = drop_indent_range(&self.blocks, moving.clone(), gap);
+        // The block shown just above the gap decides the default depth.
+        let above = rows.iter().rev().find(|(i, _)| *i < gap && !moving.contains(i));
+        let wanted = match above {
+            None => 0,
+            Some((p, row)) => {
+                let depth = self.blocks[*p].indent as i32;
+                let offset = (pos.x - self.content_left(*p, row)) / px(1.);
+                if offset > 48.0 {
+                    depth + 1
+                } else if offset < -30.0 {
+                    depth - (((-offset - 30.0) / INDENT_PX).floor() as i32 + 1)
+                } else {
+                    depth
+                }
+            }
+        };
+        let indent = wanted.clamp(min as i32, max as i32) as u8;
+        let same_place = gap == moving.start || gap == moving.end;
+        if same_place && indent == self.blocks[moving.start].indent {
+            return None;
+        }
+        Some(DropTarget { gap, indent })
+    }
+
+    pub(crate) fn drag_moved(&mut self, drag: &DragBlock, pos: Point<Pixels>, inside: bool, cx: &mut Context<Self>) {
+        self.last_mouse = Some(pos);
+        let Some(ix) = self.index_of(drag.id) else { return };
+        let moving = self.moving_range(ix);
+        let target = if inside { self.drop_target_at(pos, &moving) } else { None };
+        if self.drag_range.as_ref() != Some(&moving) || self.drop_target != target {
+            self.drag_range = Some(moving);
+            self.drop_target = target;
+            cx.notify();
+        }
+        self.ensure_autoscroll(cx);
+    }
+
+    pub(crate) fn drop_dragged(&mut self, drag: &DragBlock, cx: &mut Context<Self>) {
+        let target = self.drop_target.take();
+        self.drag_range = None;
+        let (Some(target), Some(ix)) = (target, self.index_of(drag.id)) else {
+            cx.notify();
+            return;
+        };
+        let moving = self.moving_range(ix);
+        let mut blocks = self.blocks.clone();
+        let Some(placed) = move_blocks(&mut blocks, moving, target.gap, target.indent) else {
+            cx.notify();
+            return;
+        };
         self.checkpoint(EditKind::Other);
-        let target_indent = self.blocks[to].indent;
-        let to_end = subtree_end(&self.blocks, to);
-        let base_indent = self.blocks[from].indent;
-        let mut moved: Vec<Block> = self.blocks.drain(from..from_end).collect();
-        for b in &mut moved {
-            b.indent = b.indent - base_indent + target_indent;
-        }
-        let insert_at = if to_end > from { to_end - moved.len() } else { to_end };
-        let n = moved.len();
-        for (i, b) in moved.into_iter().enumerate() {
-            self.blocks.insert(insert_at + i, b);
-        }
-        let _ = n;
-        if self.blocks[insert_at].kind.has_text() {
-            self.sel = Sel::caret(insert_at, 0);
-        }
-        self.block_sel = None;
+        self.blocks = blocks;
+        // Like Notion: the moved blocks stay selected.
+        self.block_sel = Some((placed.start, placed.end - 1));
+        self.sel = Sel::caret(placed.start, 0);
+        self.close_popups();
         self.after_edit(cx);
+    }
+
+    /// Forget drag state once the drag is over (dropped elsewhere or cancelled).
+    pub(crate) fn clear_stale_drag(&mut self, cx: &App) {
+        if !cx.has_active_drag() {
+            self.drop_target = None;
+            self.drag_range = None;
+            self.resize_start = None;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // images
+    // ----------------------------------------------------------------------
+
+    /// Natural pixel size of an image file (cached; reads only the header).
+    pub(crate) fn image_size(&self, path: &std::path::Path) -> Option<(u32, u32)> {
+        if let Some(d) = self.image_dims.borrow().get(path) {
+            return *d;
+        }
+        let d = image::image_dimensions(path).ok();
+        self.image_dims.borrow_mut().insert(path.to_path_buf(), d);
+        d
+    }
+
+    /// Insert image blocks (vault-root-relative paths) at `target`, or after
+    /// the current block. The new images end up selected.
+    fn insert_images(&mut self, assets: Vec<(String, String)>, target: Option<DropTarget>, cx: &mut Context<Self>) {
+        if assets.is_empty() {
+            return;
+        }
+        let page = self.page_id.clone();
+        let make = |s: &Store, indent: u8, (rel, alt): &(String, String)| {
+            Block::new(BlockKind::Image { src: s.vault.src_for_page(&page, rel), width: None }, alt.as_str())
+                .with_indent(indent)
+        };
+        self.checkpoint(EditKind::Other);
+        let (mut at, indent) = match target {
+            Some(t) => (t.gap.min(self.blocks.len()), t.indent),
+            None => {
+                let ix = self.sel.block.min(self.blocks.len() - 1);
+                let b = &self.blocks[ix];
+                if b.kind == BlockKind::Paragraph && b.text.is_empty() {
+                    // replace the empty line the caret is on
+                    let indent = b.indent;
+                    self.blocks.remove(ix);
+                    (ix, indent)
+                } else {
+                    (subtree_end(&self.blocks, ix), b.indent)
+                }
+            }
+        };
+        let store = self.store.read(cx);
+        let new: Vec<Block> = assets.iter().map(|a| make(store, indent, a)).collect();
+        let n = new.len();
+        let start = at;
+        for b in new {
+            self.blocks.insert(at, b);
+            at += 1;
+        }
+        if at == self.blocks.len() {
+            // keep somewhere to type after an image at the end of the page
+            self.blocks.push(Block::paragraph("").with_indent(0));
+        }
+        self.block_sel = Some((start, start + n - 1));
+        self.sel = Sel::caret(start, 0);
+        self.close_popups();
+        self.after_edit(cx);
+    }
+
+    /// Files dragged in from Finder (or a screenshot thumbnail).
+    pub(crate) fn drop_files(&mut self, paths: &[std::path::PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.drop_target.take();
+        let images: Vec<&std::path::PathBuf> = paths.iter().filter(|p| is_image_path(p)).collect();
+        if images.is_empty() {
+            self.store.update(cx, |s, cx| {
+                s.last_error = Some("Only image files can be dropped into a page.".into());
+                cx.notify();
+            });
+            return;
+        }
+        let mut assets = Vec::new();
+        for p in images {
+            let alt = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            match self.store.read(cx).vault.import_asset(p) {
+                Ok(rel) => assets.push((rel, alt)),
+                Err(err) => self.store.update(cx, |s, cx| {
+                    s.last_error = Some(format!("Could not add the image: {err:#}"));
+                    cx.notify();
+                }),
+            }
+        }
+        window.focus(&self.focus);
+        self.insert_images(assets, target, cx);
+    }
+
+    pub(crate) fn files_dragged(&mut self, pos: Point<Pixels>, inside: bool, cx: &mut Context<Self>) {
+        self.last_mouse = Some(pos);
+        // nothing moves: use a range that contains no block
+        let target = if inside { self.drop_target_at(pos, &(usize::MAX..usize::MAX)) } else { None };
+        if self.drop_target != target {
+            self.drop_target = target;
+            cx.notify();
+        }
+        self.ensure_autoscroll(cx);
+    }
+
+    /// Paste an image from the clipboard (e.g. a screenshot taken with ⌃⇧⌘4).
+    /// Returns false when the clipboard holds no image.
+    fn paste_image(&mut self, item: &gpui::ClipboardItem, cx: &mut Context<Self>) -> bool {
+        let image = item.entries().iter().find_map(|e| match e {
+            gpui::ClipboardEntry::Image(img) => Some(img),
+            _ => None,
+        });
+        let Some(image) = image else { return false };
+        use gpui::ImageFormat as F;
+        let ext = match image.format {
+            F::Png => "png",
+            F::Jpeg => "jpg",
+            F::Webp => "webp",
+            F::Gif => "gif",
+            F::Svg => "svg",
+            F::Bmp => "bmp",
+            F::Tiff => "tiff",
+        };
+        let name = format!("Pasted image {}", chrono::Local::now().format("%Y-%m-%d %H.%M.%S"));
+        match self.store.read(cx).vault.add_asset(&name, ext, &image.bytes) {
+            Ok(rel) => self.insert_images(vec![(rel, String::new())], None, cx),
+            Err(err) => self.store.update(cx, |s, cx| {
+                s.last_error = Some(format!("Could not save the image: {err:#}"));
+                cx.notify();
+            }),
+        }
+        true
+    }
+
+    pub(crate) fn start_resize(&mut self, id: u64, x: Pixels, width: f32) {
+        self.checkpoint(EditKind::Other);
+        self.resize_start = Some((id, x, width));
+    }
+
+    pub(crate) fn resize_moved(&mut self, drag: &ResizeImage, x: Pixels, max: f32, cx: &mut Context<Self>) {
+        let Some((id, start_x, start_w)) = self.resize_start.filter(|r| r.0 == drag.id) else { return };
+        let Some(ix) = self.index_of(id) else { return };
+        // images are centred, so each side moves by half the change
+        let w = (start_w + 2.0 * drag.side * ((x - start_x) / px(1.))).clamp(48.0, max).round() as u32;
+        if let BlockKind::Image { width, .. } = &mut self.blocks[ix].kind {
+            if *width != Some(w) {
+                *width = Some(w);
+                self.after_edit(cx);
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // rubber-band selection and auto-scroll
+    // ----------------------------------------------------------------------
+
+    /// Start a selection rectangle at `pos` (window coordinates).
+    pub fn begin_marquee(&mut self, pos: Point<Pixels>, from_tail: bool, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        self.close_popups();
+        self.selecting = false;
+        let offset = self.scroll.offset();
+        self.marquee = Some(Marquee {
+            start: point(pos.x - offset.x, pos.y - offset.y),
+            current: pos,
+            active: false,
+            from_tail,
+        });
+        self.last_mouse = Some(pos);
+        cx.notify();
+    }
+
+    /// The rectangle's start point in window coordinates (follows scrolling).
+    pub(crate) fn marquee_origin(&self) -> Option<Point<Pixels>> {
+        let m = self.marquee.as_ref()?;
+        let offset = self.scroll.offset();
+        Some(point(m.start.x + offset.x, m.start.y + offset.y))
+    }
+
+    fn update_marquee(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(origin) = self.marquee_origin() else { return };
+        let Some(m) = self.marquee.as_mut() else { return };
+        m.current = pos;
+        if !m.active {
+            if (pos - origin).magnitude() < 4.0 {
+                return;
+            }
+            m.active = true;
+            self.sel.range = self.sel.cursor()..self.sel.cursor();
+        }
+        let (top, bottom) = (origin.y.min(pos.y), origin.y.max(pos.y));
+        let hit: Vec<usize> = self
+            .visible_rows()
+            .into_iter()
+            .filter(|(_, b)| b.bottom() > top && b.top() < bottom)
+            .map(|(i, _)| i)
+            .collect();
+        self.block_sel = match (hit.first(), hit.last()) {
+            (Some(&first), Some(&last)) if pos.y >= origin.y => Some((first, last)),
+            (Some(&first), Some(&last)) => Some((last, first)),
+            _ => None,
+        };
+        cx.notify();
+    }
+
+    fn end_marquee(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(m) = self.marquee.take() {
+            if !m.active {
+                self.block_sel = None;
+                if m.from_tail {
+                    self.click_below(window, cx);
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    /// Scroll speed for a pointer near the top or bottom edge of the page.
+    fn edge_speed(&self, pos: Point<Pixels>) -> Option<Pixels> {
+        let vp = self.scroll.bounds();
+        if vp.size.height <= px(0.) {
+            return None;
+        }
+        let edge = px(56.);
+        let dy = if pos.y < vp.top() + edge {
+            vp.top() + edge - pos.y
+        } else if pos.y > vp.bottom() - edge {
+            -(pos.y - (vp.bottom() - edge))
+        } else {
+            return None;
+        };
+        let step = (dy / px(1.) * 0.35).clamp(-24.0, 24.0);
+        (step.abs() >= 0.5).then_some(px(step))
+    }
+
+    fn pointer_busy(&self, cx: &App) -> bool {
+        self.selecting || self.marquee.as_ref().is_some_and(|m| m.active) || cx.has_active_drag()
+    }
+
+    /// Keep scrolling while the pointer rests near an edge during a drag.
+    fn ensure_autoscroll(&mut self, cx: &mut Context<Self>) {
+        if self.autoscrolling || !self.pointer_busy(cx) {
+            return;
+        }
+        if self.last_mouse.and_then(|p| self.edge_speed(p)).is_none() {
+            return;
+        }
+        self.autoscrolling = true;
+        self._autoscroll = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(16)).await;
+            let more = this.update(cx, |this, cx| this.autoscroll_step(cx)).unwrap_or(false);
+            if !more {
+                this.update(cx, |this, _| this.autoscrolling = false).ok();
+                break;
+            }
+        }));
+    }
+
+    fn autoscroll_step(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.pointer_busy(cx) {
+            return false;
+        }
+        let Some(pos) = self.last_mouse else { return false };
+        let Some(step) = self.edge_speed(pos) else { return false };
+        let mut offset = self.scroll.offset();
+        let max = self.scroll.max_offset().height;
+        let y = (offset.y + step).min(px(0.)).max(-max);
+        if y == offset.y {
+            return false;
+        }
+        offset.y = y;
+        self.scroll.set_offset(offset);
+        if self.marquee.is_some() {
+            self.update_marquee(pos, cx);
+        } else if self.selecting {
+            self.extend_selection(pos, cx);
+        }
+        cx.notify();
+        true
     }
 
     fn move_block(&mut self, up: bool, cx: &mut Context<Self>) {
@@ -830,7 +1470,7 @@ impl Editor {
 
     fn indent_blocks(&mut self, outdent: bool, cx: &mut Context<Self>) {
         let range = match self.block_sel_range() {
-            Some(r) => r,
+            Some(r) => expand_to_subtrees(&self.blocks, r),
             None => self.sel.block..subtree_end(&self.blocks, self.sel.block),
         };
         if range.start == 0 && !outdent {
@@ -920,7 +1560,7 @@ impl Editor {
 
     pub(crate) fn toggle_mark(&mut self, kind: MarkKind, cx: &mut Context<Self>) {
         let ix = self.sel.block;
-        if matches!(self.blocks[ix].kind, BlockKind::Code { .. }) || !self.blocks[ix].kind.has_text() {
+        if self.blocks[ix].kind.is_raw() || !self.blocks[ix].kind.has_text() {
             return;
         }
         if self.sel.range.is_empty() {
@@ -1011,7 +1651,7 @@ impl Editor {
         self.checkpoint(EditKind::Other);
         let block = self.blocks.remove(ix);
         let at = self.blocks[prev].text.len();
-        if matches!(self.blocks[prev].kind, BlockKind::Code { .. }) {
+        if self.blocks[prev].kind.is_raw() {
             self.blocks[prev].text.replace(at..at, &block.text.text, Some(Marks::default()));
         } else {
             self.blocks[prev].text.append(&block.text);
@@ -1130,7 +1770,7 @@ impl Editor {
         }
         let ix = self.sel.block;
         let kind = self.blocks[ix].kind.clone();
-        if let BlockKind::Code { .. } = kind {
+        if kind.is_raw() {
             // keep the indentation of the current line
             let caret = self.sel.range.start;
             let text = self.text();
@@ -1215,7 +1855,7 @@ impl Editor {
     }
 
     pub(crate) fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
-        if self.block_sel.is_none() && matches!(self.cur().kind, BlockKind::Code { .. }) {
+        if self.block_sel.is_none() && self.cur().kind.is_raw() {
             let r = self.sel.range.clone();
             self.insert_text(r, "    ", cx);
             return;
@@ -1547,8 +2187,106 @@ impl Editor {
         cx.notify();
     }
 
+    /// The current selection, for Nota AI.
+    pub fn ai_selection(&self) -> Option<AiSelection> {
+        let (plain, markdown) = self.clipboard_contents()?;
+        if plain.trim().is_empty() {
+            return None;
+        }
+        let target = match self.block_sel_range() {
+            Some(r) => {
+                let r = expand_to_subtrees(&self.blocks, r);
+                AiTarget::Blocks { first: self.blocks[r.start].id, last: self.blocks[r.end - 1].id }
+            }
+            None => AiTarget::Text { block: self.cur().id, range: self.sel.range.clone() },
+        };
+        let flat = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview: String = flat.chars().take(48).collect();
+        let preview = if flat.chars().count() > 48 { format!("{preview}…") } else { preview };
+        Some(AiSelection { markdown, preview, target })
+    }
+
+    /// Put an AI answer into the page: in place of `target` (`replace`) or
+    /// right below it. Returns false if the target no longer exists.
+    pub fn apply_ai(&mut self, md: &str, target: &AiTarget, replace: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let mut blocks = from_markdown(md);
+        if blocks.is_empty() {
+            return true;
+        }
+        let range = match target {
+            AiTarget::Text { block, range } => {
+                let Some(ix) = self.index_of(*block) else { return false };
+                if replace && self.blocks[ix].kind.has_text() {
+                    let len = self.blocks[ix].text.len();
+                    let text = &self.blocks[ix].text.text;
+                    let r = clamp(text, range.start.min(len))..clamp(text, range.end.min(len));
+                    self.block_sel = None;
+                    self.sel = Sel { block: ix, range: r, reversed: false };
+                    window.focus(&self.focus);
+                    self.insert_markdown(md.to_string(), true, cx);
+                    return true;
+                }
+                ix..subtree_end(&self.blocks, ix)
+            }
+            AiTarget::Blocks { first, last } => {
+                let (Some(a), Some(b)) = (self.index_of(*first), self.index_of(*last)) else { return false };
+                expand_to_subtrees(&self.blocks, a.min(b)..a.max(b) + 1)
+            }
+        };
+        self.checkpoint(EditKind::Other);
+        let indent = self.blocks[range.start].indent;
+        for b in &mut blocks {
+            b.indent = b.indent.saturating_add(indent);
+        }
+        let n = blocks.len();
+        let at = if replace {
+            self.blocks.splice(range.clone(), blocks);
+            range.start
+        } else {
+            self.blocks.splice(range.end..range.end, blocks);
+            range.end
+        };
+        self.block_sel = Some((at, at + n - 1));
+        self.sel = Sel::caret(at, 0);
+        self.scroll_pending = true;
+        window.focus(&self.focus);
+        self.after_edit(cx);
+        true
+    }
+
+    /// Selected blocks (with their children) as Markdown.
+    fn selected_blocks_markdown(&self) -> Option<String> {
+        let r = expand_to_subtrees(&self.blocks, self.block_sel_range()?);
+        let mut blocks: Vec<Block> = self.blocks[r].to_vec();
+        let base = blocks.iter().map(|b| b.indent).min().unwrap_or(0);
+        for b in &mut blocks {
+            b.indent -= base;
+        }
+        Some(to_markdown(&blocks))
+    }
+
+    /// What goes on the clipboard: (plain text, Markdown kept for pasting back into Nota).
+    fn clipboard_contents(&self) -> Option<(String, String)> {
+        if let Some(md) = self.selected_blocks_markdown() {
+            return Some((md.clone(), md));
+        }
+        if self.sel.range.is_empty() {
+            return None;
+        }
+        let r = self.sel.range.clone();
+        let plain = self.text()[r.clone()].to_string();
+        if self.cur().kind.is_raw() {
+            return Some((plain.clone(), plain));
+        }
+        let mut rich = self.cur().text.clone();
+        rich.split_off(r.end);
+        let part = rich.split_off(r.start);
+        Some((plain, nota_core::markdown::inline_to_md(&part)))
+    }
+
     fn selected_markdown(&self) -> Option<String> {
         if let Some(r) = self.block_sel_range() {
+            let r = expand_to_subtrees(&self.blocks, r);
             let mut blocks: Vec<Block> = self.blocks[r].to_vec();
             let base = blocks.iter().map(|b| b.indent).min().unwrap_or(0);
             for b in &mut blocks {
@@ -1563,22 +2301,50 @@ impl Editor {
     }
 
     pub(crate) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.selected_markdown() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if let Some((plain, md)) = self.clipboard_contents() {
+            cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(plain, md));
         }
     }
 
     pub(crate) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.selected_markdown() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if let Some((plain, md)) = self.clipboard_contents() {
+            cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(plain, md));
             self.backspace(&Backspace, window, cx);
         }
     }
 
-    pub(crate) fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+    pub(crate) fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
             return;
         };
+        let text = item.text();
+        if text.is_none() && self.paste_image(&item, cx) {
+            return;
+        }
+        // Copied from Nota: the Markdown version keeps formatting and structure.
+        let nota_md = item.entries().first().and_then(|e| match e {
+            gpui::ClipboardEntry::String(s) => s.metadata_json::<String>(),
+            _ => None,
+        });
+        let from_nota = nota_md.is_some();
+        let Some(text) = nota_md.or(text) else {
+            return;
+        };
+        // a copied image file (path or file:// URL)
+        let as_path = text.trim().strip_prefix("file://").map(|p| nota_core::markdown::decode_url(p)).unwrap_or_else(|| text.trim().to_string());
+        let path = std::path::PathBuf::from(&as_path);
+        if !as_path.contains('\n') && path.is_absolute() && is_image_path(&path) && path.is_file() {
+            self.drop_target = None;
+            self.drop_files(&[path], window, cx);
+            return;
+        }
+        self.insert_markdown(text, from_nota, cx);
+    }
+
+    /// Insert pasted (or AI-written) text at the caret, replacing the selection.
+    /// `structured` text is Markdown from Nota; anything else is plain text.
+    fn insert_markdown(&mut self, text: String, structured: bool, cx: &mut Context<Self>) {
+        let from_nota = structured;
         let text = text.replace("\r\n", "\n");
         if text.is_empty() {
             return;
@@ -1588,7 +2354,7 @@ impl Editor {
         if !self.blocks[ix].kind.has_text() {
             return;
         }
-        let is_code = matches!(self.blocks[ix].kind, BlockKind::Code { .. });
+        let is_code = self.blocks[ix].kind.is_raw();
         if is_code {
             let r = self.sel.range.clone();
             self.insert_text(r, &text, cx);
@@ -1621,31 +2387,52 @@ impl Editor {
             self.after_edit(cx);
             return;
         }
-        let mut pasted = from_markdown(&text);
+        let source = if from_nota { text.clone() } else { lines_as_blocks(&text) };
+        let mut pasted = from_markdown(&source);
         if pasted.is_empty() {
             return;
         }
         self.checkpoint(EditKind::Other);
+        // the pasted blocks replace the selected text
+        let r = self.sel.range.clone();
+        if !r.is_empty() {
+            self.blocks[ix].text.replace(r.clone(), "", None);
+        }
+        let caret = r.start;
         let indent = self.blocks[ix].indent;
         for b in &mut pasted {
             b.indent = b.indent.saturating_add(indent);
         }
-        let n = pasted.len();
-        let at = if self.blocks[ix].kind == BlockKind::Paragraph && self.blocks[ix].text.is_empty() {
-            self.blocks.remove(ix);
-            ix
-        } else {
-            subtree_end(&self.blocks, ix)
-        };
-        for (i, b) in pasted.into_iter().enumerate() {
-            self.blocks.insert(at + i, b);
+        if self.blocks[ix].kind == BlockKind::Paragraph && self.blocks[ix].text.is_empty() {
+            let n = pasted.len();
+            self.blocks.splice(ix..ix + 1, pasted);
+            let last = ix + n - 1;
+            let end = if self.blocks[last].kind.has_text() { self.blocks[last].text.len() } else { 0 };
+            self.sel = Sel::caret(last, end);
+            self.after_edit(cx);
+            return;
         }
-        let last = at + n - 1;
-        self.sel = if self.blocks[last].kind.has_text() {
-            Sel::caret(last, self.blocks[last].text.len())
-        } else {
-            Sel::caret(last, 0)
-        };
+        // Split the current line around the caret, like Notion: the first
+        // pasted paragraph continues it and the rest of the line follows the paste.
+        let tail = self.blocks[ix].text.split_off(caret);
+        if pasted[0].kind == BlockKind::Paragraph && !self.blocks[ix].kind.is_raw() {
+            let first = pasted.remove(0);
+            self.blocks[ix].text.append(&first.text);
+        }
+        let at = if tail.is_empty() { subtree_end(&self.blocks, ix) } else { ix + 1 };
+        let n = pasted.len();
+        self.blocks.splice(at..at, pasted);
+        let last = if n == 0 { ix } else { at + n - 1 };
+        let end = if self.blocks[last].kind.has_text() { self.blocks[last].text.len() } else { 0 };
+        if !tail.is_empty() {
+            if self.blocks[last].kind.has_text() && !self.blocks[last].kind.is_raw() {
+                self.blocks[last].text.append(&tail);
+            } else {
+                let depth = self.blocks[ix].indent;
+                self.blocks.insert(last + 1, Block::paragraph(tail).with_indent(depth));
+            }
+        }
+        self.sel = Sel::caret(last, end);
         self.after_edit(cx);
     }
 
@@ -1704,13 +2491,24 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus);
         cx.stop_propagation();
-        self.close_popups();
         self.goal_x = None;
         if ix >= self.blocks.len() {
             return;
         }
+        // A press in the margin beside a block starts a selection rectangle.
+        let row = self.row_bounds.borrow().get(&self.blocks[ix].id).copied();
+        if let Some(row) = row {
+            let x = event.position.x;
+            if !event.modifiers.shift
+                && (x < self.content_left(ix, &row) - px(2.) || x > row.right() - px(GUTTER_PX) + px(2.))
+            {
+                self.begin_marquee(event.position, false, window, cx);
+                return;
+            }
+        }
+        window.focus(&self.focus);
+        self.close_popups();
         if !self.blocks[ix].kind.has_text() {
             self.block_sel = Some((ix, ix));
             cx.notify();
@@ -1759,56 +2557,42 @@ impl Editor {
         cx.notify();
     }
 
+    /// Pointer moved anywhere in the window while a text selection or a
+    /// selection rectangle is in progress.
     pub(crate) fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selecting {
+        if !self.selecting && self.marquee.is_none() {
             return;
         }
         if event.pressed_button != Some(MouseButton::Left) {
             self.selecting = false;
+            self.marquee = None;
+            cx.notify();
             return;
         }
+        self.last_mouse = Some(event.position);
+        if self.marquee.is_some() {
+            self.update_marquee(event.position, cx);
+        } else {
+            self.extend_selection(event.position, cx);
+        }
+        self.ensure_autoscroll(cx);
+    }
+
+    /// The visible block whose row is at height `y` (or the nearest one).
+    fn row_at_y(&self, y: Pixels) -> Option<usize> {
+        let rows = self.visible_rows();
+        rows.iter().find(|(_, b)| y <= b.bottom()).or(rows.last()).map(|(i, _)| *i)
+    }
+
+    fn extend_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         let Some((anchor_block, anchor_offset)) = self.drag_anchor else {
             return;
         };
-        // which block is under the pointer?
-        let vis = visibility(&self.blocks);
-        let layouts = self.layouts.borrow();
-        let mut target = None;
-        let mut first: Option<(usize, Pixels)> = None;
-        let mut last: Option<(usize, Pixels)> = None;
-        for (i, b) in self.blocks.iter().enumerate() {
-            if !vis[i] {
-                continue;
-            }
-            let Some(l) = layouts.get(&b.id) else {
-                continue;
-            };
-            let bounds = l.bounds();
-            if first.is_none() {
-                first = Some((i, bounds.top()));
-            }
-            last = Some((i, bounds.bottom()));
-            if event.position.y >= bounds.top() - px(3.) && event.position.y <= bounds.bottom() + px(3.) {
-                target = Some(i);
-                break;
-            }
-        }
-        if target.is_none() {
-            if let (Some((fi, top)), Some((li, bottom))) = (first, last) {
-                if event.position.y < top {
-                    target = Some(fi);
-                } else if event.position.y > bottom {
-                    target = Some(li);
-                }
-            }
-        }
-        let offset = layouts
-            .get(&self.blocks[anchor_block.min(self.blocks.len() - 1)].id)
-            .map(|l| l.index_for_point(event.position));
-        drop(layouts);
-        let Some(target) = target else {
+        let anchor_block = anchor_block.min(self.blocks.len() - 1);
+        let Some(target) = self.row_at_y(pos.y) else {
             return;
         };
+        let offset = self.layout_of(anchor_block).map(|l| l.index_for_point(pos));
         if target == anchor_block {
             self.block_sel = None;
             if let Some(offset) = offset {
@@ -1823,11 +2607,19 @@ impl Editor {
         cx.notify();
     }
 
-    pub(crate) fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_mouse_up(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.selecting {
             self.selecting = false;
             cx.notify();
         }
+        if self.marquee.is_some() {
+            self.end_marquee(window, cx);
+        }
+    }
+
+    /// Whether the pointer is currently being tracked outside normal hover.
+    pub(crate) fn tracking_pointer(&self) -> bool {
+        self.selecting || self.marquee.is_some()
     }
 
     /// Click in the empty space under the last block.
@@ -1851,6 +2643,29 @@ impl Editor {
 // --------------------------------------------------------------------------
 // IME / text input
 // --------------------------------------------------------------------------
+
+/// Plain text from other apps: every line becomes its own block (as in
+/// Notion), except inside code fences and tables.
+fn lines_as_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut in_fence = false;
+    let mut prev_content = false;
+    for line in text.split('\n') {
+        let t = line.trim_start();
+        let fence = t.starts_with("```");
+        let table = t.starts_with('|');
+        if !in_fence && prev_content && !t.is_empty() && !table && !fence {
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+        if fence {
+            in_fence = !in_fence;
+        }
+        prev_content = !in_fence && !t.is_empty() && !table && !fence;
+    }
+    out
+}
 
 impl EntityInputHandler for Editor {
     fn text_for_range(
@@ -1928,7 +2743,7 @@ impl EntityInputHandler for Editor {
             .unwrap_or(self.sel.range.clone());
         self.checkpoint(EditKind::Typing);
         let ix = self.sel.block;
-        let marks = if matches!(self.blocks[ix].kind, BlockKind::Code { .. }) {
+        let marks = if self.blocks[ix].kind.is_raw() {
             Some(Marks::default())
         } else if range.is_empty() {
             self.pending_marks.clone()

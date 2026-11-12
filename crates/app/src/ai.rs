@@ -3,13 +3,14 @@
 //! answer back as rendered blocks.
 
 use crate::blocks_view::static_blocks;
+use crate::editor::{AiSelection, AiTarget};
 use crate::store::Store;
 use crate::text_input::{InputEvent, TextInput};
 use crate::theme::{theme, Theme};
 use crate::ui::*;
 use gpui::{
-    div, prelude::*, px, AnyElement, ClipboardItem, Context, Entity, EventEmitter, FontWeight, ScrollHandle,
-    SharedString, Subscription, Task, Window,
+    div, prelude::*, px, AnyElement, ClipboardItem, Context, Corner, Entity, EventEmitter, FontWeight, Pixels,
+    Point, ScrollHandle, SharedString, Subscription, Task, Window,
 };
 use nota_core::markdown::{from_markdown, to_markdown};
 use nota_core::query::prop_text;
@@ -22,6 +23,10 @@ use std::process::Stdio;
 pub enum AiEvent {
     /// Insert this Markdown at the end of the open page.
     Insert(String),
+    /// Insert below the part of the page the question was about.
+    InsertBelow(String, AiTarget),
+    /// Replace the part of the page the question was about.
+    Replace(String, AiTarget),
     Close,
 }
 
@@ -30,14 +35,51 @@ struct Msg {
     text: String,
     blocks: Vec<Block>,
     error: bool,
+    /// The selection this answer is about (answers only).
+    target: Option<AiTarget>,
+    /// Shown above a question that was sent with a selection.
+    quote: Option<String>,
 }
 
 impl Msg {
     fn new(user: bool, text: impl Into<String>) -> Self {
         let text = text.into();
         let blocks = if user { vec![] } else { from_markdown(&text) };
-        Msg { user, text, blocks, error: false }
+        Msg { user, text, blocks, error: false, target: None, quote: None }
     }
+}
+
+/// The dropdowns under the prompt.
+#[derive(Clone, Copy, PartialEq)]
+enum ComposerMenu {
+    Access,
+    Model,
+    Effort,
+}
+
+const MODELS: [(Option<&str>, &str); 5] = [
+    (None, "Default"),
+    (Some("fable"), "Fable"),
+    (Some("opus"), "Opus"),
+    (Some("sonnet"), "Sonnet"),
+    (Some("haiku"), "Haiku"),
+];
+
+const EFFORTS: [(Option<&str>, &str); 6] = [
+    (None, "Default"),
+    (Some("low"), "Low"),
+    (Some("medium"), "Medium"),
+    (Some("high"), "High"),
+    (Some("xhigh"), "Extra high"),
+    (Some("max"), "Max"),
+];
+
+fn label_of(options: &[(Option<&str>, &'static str)], value: Option<&str>) -> String {
+    options
+        .iter()
+        .find(|(v, _)| *v == value)
+        .map(|(_, l)| l.to_string())
+        .unwrap_or_else(|| value.unwrap_or("Default").to_string())
 }
 
 #[derive(Clone)]
@@ -118,15 +160,20 @@ The working directory is the user's vault: every page is one Markdown file with 
 pages whose `parent` is the database id and whose `props` hold the property values. Use Read, Grep and Glob \
 to look things up in the vault when the question is about the user's notes. Reply in the user's language, \
 in concise Markdown (headings, lists, `- [ ]` to-dos, fenced code). The reply may be inserted into a page as \
-blocks, so never wrap the whole reply in a code fence and do not use tables or HTML.";
+blocks, so never wrap the whole reply in a code fence and do not use HTML. When the message includes a \
+<selection> and asks to change it (rewrite, translate, shorten, fix, continue…), reply with only the new \
+version of that content, with no preamble, so it can replace the selection. The <access> tag in each \
+message says whether you may edit files; it can change between messages.";
 
-const SYSTEM_READONLY: &str = " You cannot modify files in this mode. If the user wants content added to a page, \
-write that content as your reply: they can click \"Insert into page\", or turn on \"Allow edits\".";
+const ACCESS_READONLY: &str = "<access>read-only: you cannot modify files now. If the user wants content added \
+to a page, write that content as your reply; they can insert it with one click, or switch Nota AI to \
+\"Can edit\".</access>";
 
-const SYSTEM_EDIT: &str = " You may create and edit files in the vault. Rules: never change an existing `id`; keep \
-the front matter valid YAML; to create a page, write a new .md file with a fresh 32-character lowercase hex `id`, \
-a `title`, optional `parent` (the id of the parent page or database) and ISO-8601 `created`/`updated`; body \
-indentation for nested blocks is 4 spaces. After editing, briefly say what you changed.";
+const ACCESS_EDIT: &str = "<access>can edit: you may create and edit files in the vault. Rules: never change an \
+existing `id`; keep the front matter valid YAML; to create a page, write a new .md file with a fresh \
+32-character lowercase hex `id`, a `title`, optional `parent` (the id of the parent page or database) and \
+ISO-8601 `created`/`updated`; body indentation for nested blocks is 4 spaces. After editing, briefly say what \
+you changed.</access>";
 
 pub struct AiPanel {
     store: Entity<Store>,
@@ -137,6 +184,10 @@ pub struct AiPanel {
     status: String,
     context_page: Option<String>,
     use_context: bool,
+    /// What is selected in the open page right now.
+    selection: Option<AiSelection>,
+    use_selection: bool,
+    menu: Option<(ComposerMenu, Point<Pixels>)>,
     got_delta: bool,
     edited: bool,
     env: Option<ClaudeEnv>,
@@ -173,6 +224,9 @@ impl AiPanel {
             status: String::new(),
             context_page: None,
             use_context: true,
+            selection: None,
+            use_selection: true,
+            menu: None,
             got_delta: false,
             edited: false,
             env: None,
@@ -182,8 +236,27 @@ impl AiPanel {
     }
 
     pub fn set_context(&mut self, page: Option<String>, cx: &mut Context<Self>) {
+        if self.context_page != page {
+            self.selection = None;
+        }
         self.context_page = page;
         cx.notify();
+    }
+
+    /// The editor's selection changed.
+    pub fn set_selection(&mut self, selection: Option<AiSelection>, cx: &mut Context<Self>) {
+        if self.selection != selection {
+            // a new selection is attached again even if the last one was dismissed
+            if selection.as_ref().map(|s| &s.target) != self.selection.as_ref().map(|s| &s.target) {
+                self.use_selection = true;
+            }
+            self.selection = selection;
+            cx.notify();
+        }
+    }
+
+    fn active_selection(&self) -> Option<&AiSelection> {
+        self.selection.as_ref().filter(|_| self.use_selection)
     }
 
     pub fn focus_input(&self, window: &mut Window, cx: &gpui::App) {
@@ -270,12 +343,19 @@ impl AiPanel {
             body.truncate(cut);
             body.push_str("\n…(truncated)");
         }
-        format!(
+        let mut out = format!(
             "<current_page title=\"{}\" file=\"{}\">\n{}\n</current_page>\n\n",
             page.display_title().replace('"', "'"),
             file,
             body
-        )
+        );
+        if let Some(sel) = self.active_selection() {
+            out.push_str(&format!(
+                "<selection>\nThe user selected this part of the page:\n{}\n</selection>\n\n",
+                sel.markdown.trim_end()
+            ));
+        }
+        out
     }
 
     fn send(&mut self, preset: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
@@ -294,22 +374,39 @@ impl AiPanel {
         }
         self.input.read(cx).focus(window);
         self.store.update(cx, |s, _| s.flush());
-        let prompt = format!("{}{}", self.context_text(cx), text);
-        self.messages.push(Msg::new(true, text));
-        self.messages.push(Msg::new(false, ""));
+        let allow_edits = self.store.read(cx).state.ai_allow_edits;
+        let access = if allow_edits { ACCESS_EDIT } else { ACCESS_READONLY };
+        let prompt = format!("{}\n\n{}{}", access, self.context_text(cx), text);
+        let sel = self.active_selection().cloned();
+        let mut question = Msg::new(true, text);
+        question.quote = sel.as_ref().map(|s| s.preview.clone());
+        self.messages.push(question);
+        let mut answer = Msg::new(false, "");
+        answer.target = sel.map(|s| s.target);
+        self.messages.push(answer);
+        self.menu = None;
         self.status = "Thinking…".into();
         self.got_delta = false;
         self.edited = false;
         self.scroll.scroll_to_bottom();
 
-        let allow_edits = self.store.read(cx).state.ai_allow_edits;
+        let (model, effort) = {
+            let st = &self.store.read(cx).state;
+            (st.ai_model.clone(), st.ai_effort.clone())
+        };
         let root = self.store.read(cx).vault.root.clone();
         let session = self.session.clone();
         let known_env = self.env.clone();
         let mut args: Vec<String> =
             ["-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"].map(String::from).into();
         args.push("--append-system-prompt".into());
-        args.push(format!("{}{}", SYSTEM, if allow_edits { SYSTEM_EDIT } else { SYSTEM_READONLY }));
+        args.push(SYSTEM.to_string());
+        if let Some(m) = model {
+            args.extend(["--model".to_string(), m]);
+        }
+        if let Some(e) = effort {
+            args.extend(["--effort".to_string(), e]);
+        }
         if let Some(s) = session {
             args.push("--resume".into());
             args.push(s);
@@ -377,7 +474,11 @@ impl AiPanel {
                 if empty {
                     let detail = stderr.trim();
                     let msg = if !detail.is_empty() {
-                        detail.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+                        let mut m = detail.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                        if detail.contains("unknown option") || detail.contains("Unknown option") {
+                            m.push_str("\n\nYour Claude Code is too old for the selected model or effort. Run `claude update`, or set them back to Default.");
+                        }
+                        m
                     } else {
                         match status {
                             Ok(s) if s.success() => "Claude returned an empty answer.".to_string(),
@@ -533,9 +634,21 @@ impl AiPanel {
 
     fn render_message(&self, ix: usize, m: &Msg, last: bool, t: &Theme, cx: &Context<Self>) -> AnyElement {
         if m.user {
-            return div()
-                .flex()
-                .justify_end()
+            let mut col = div().flex().flex_col().items_end().gap(px(4.));
+            if let Some(q) = &m.quote {
+                col = col.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .max_w(px(300.))
+                        .text_size(px(12.))
+                        .text_color(t.text_faint)
+                        .child(icon("quote", 12., t.text_faint))
+                        .child(div().whitespace_nowrap().overflow_hidden().text_ellipsis().child(SharedString::from(q.clone()))),
+                );
+            }
+            return col
                 .child(
                     div()
                         .max_w(px(300.))
@@ -570,6 +683,7 @@ impl AiPanel {
             );
         } else if !m.error && !m.text.is_empty() {
             let (a, b) = (m.text.clone(), m.text.clone());
+            let can_insert = self.page_has_editor(cx);
             let small = |id: (&'static str, usize), name: &'static str, label: &'static str| {
                 let hover = t.hover;
                 div()
@@ -587,19 +701,29 @@ impl AiPanel {
                     .child(icon(name, 13., t.text_muted))
                     .child(label)
             };
-            col = col.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(2.))
-                    .ml(px(-6.))
-                    .child(small(("ai-insert", ix), "insert", "Insert into page").on_click(cx.listener(
-                        move |_, _, _, cx| cx.emit(AiEvent::Insert(a.clone())),
-                    )))
-                    .child(small(("ai-copy", ix), "copy", "Copy").on_click(cx.listener(move |_, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(b.clone()))
-                    }))),
-            );
+            let mut actions = div().flex().flex_wrap().items_center().gap(px(2.)).ml(px(-6.));
+            match (&m.target, can_insert) {
+                (Some(target), true) => {
+                    let (r_text, r_target) = (m.text.clone(), target.clone());
+                    let (b_text, b_target) = (m.text.clone(), target.clone());
+                    actions = actions
+                        .child(small(("ai-replace", ix), "check", "Replace selection").on_click(cx.listener(
+                            move |_, _, _, cx| cx.emit(AiEvent::Replace(r_text.clone(), r_target.clone())),
+                        )))
+                        .child(small(("ai-below", ix), "insert", "Insert below").on_click(cx.listener(
+                            move |_, _, _, cx| cx.emit(AiEvent::InsertBelow(b_text.clone(), b_target.clone())),
+                        )));
+                }
+                (None, true) => {
+                    actions = actions.child(small(("ai-insert", ix), "insert", "Insert into page").on_click(
+                        cx.listener(move |_, _, _, cx| cx.emit(AiEvent::Insert(a.clone()))),
+                    ));
+                }
+                _ => {}
+            }
+            col = col.child(actions.child(small(("ai-copy", ix), "copy", "Copy").on_click(cx.listener(
+                move |_, _, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(b.clone())),
+            ))));
         }
         col.into_any_element()
     }
@@ -658,12 +782,93 @@ impl AiPanel {
         col.into_any_element()
     }
 
+    /// Whether answers can be put into the open page (databases have no body).
+    fn page_has_editor(&self, cx: &Context<Self>) -> bool {
+        let s = self.store.read(cx);
+        self.context_page
+            .as_ref()
+            .and_then(|id| s.page(id))
+            .is_some_and(|p| !p.is_database() && p.load_error.is_none())
+    }
+
+    fn render_menu(&self, t: &Theme, cx: &Context<Self>) -> Option<AnyElement> {
+        let (menu, pos) = self.menu?;
+        let st = &self.store.read(cx).state;
+        let check = |on: bool| on.then(|| icon("check", 14., t.text_muted));
+        let mut surface = menu_surface(t).w(px(230.));
+        match menu {
+            ComposerMenu::Access => {
+                let allow = st.ai_allow_edits;
+                for (i, (on, label, hint)) in [
+                    (false, "Read-only", "Can read your notes, can't change them"),
+                    (true, "Can edit", "May create and edit pages"),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let mut item = menu_item(("ai-acc", i), Some(if on { "edit" } else { "eye" }), label, t)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.menu = None;
+                            this.store.update(cx, |s, cx| {
+                                s.state.ai_allow_edits = on;
+                                s.save_state();
+                                cx.notify();
+                            })
+                        }));
+                    if let Some(c) = check(allow == on) {
+                        item = item.child(c);
+                    }
+                    surface = surface.child(item).child(
+                        div().px(px(38.)).pb(px(4.)).mt(px(-4.)).text_size(px(12.)).text_color(t.text_faint).child(hint),
+                    );
+                }
+            }
+            ComposerMenu::Model | ComposerMenu::Effort => {
+                let (options, current): (&[(Option<&str>, &str)], Option<String>) = if menu == ComposerMenu::Model {
+                    (&MODELS, st.ai_model.clone())
+                } else {
+                    (&EFFORTS, st.ai_effort.clone())
+                };
+                surface = surface.child(menu_label(if menu == ComposerMenu::Model { "Model" } else { "Thinking effort" }, t));
+                for (i, (value, label)) in options.iter().enumerate() {
+                    let v = value.map(String::from);
+                    let mut item = menu_item(("ai-opt", i), None, *label, t).on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        let v = v.clone();
+                        this.store.update(cx, |s, cx| {
+                            if menu == ComposerMenu::Model {
+                                s.state.ai_model = v;
+                            } else {
+                                s.state.ai_effort = v;
+                            }
+                            s.save_state();
+                            cx.notify();
+                        })
+                    }));
+                    if let Some(c) = check(current.as_deref() == *value) {
+                        item = item.child(c);
+                    }
+                    surface = surface.child(item);
+                }
+            }
+        }
+        Some(popover(
+            pos,
+            Corner::BottomLeft,
+            surface,
+            cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                cx.notify();
+            }),
+        ))
+    }
+
     fn render_composer(&self, t: &Theme, cx: &Context<Self>) -> AnyElement {
         let s = self.store.read(cx);
         let allow = s.state.ai_allow_edits;
         let running = self.running.is_some();
         let hover = t.hover;
-        let mut chips = div().flex().items_center().gap(px(6.)).pb(px(8.));
+        let mut chips = div().flex().items_center().gap(px(6.)).pb(px(8.)).min_w_0();
         if let Some(page) = self.context_page.as_ref().and_then(|id| s.page(id)) {
             let on = self.use_context;
             chips = chips.child(
@@ -699,6 +904,45 @@ impl AiPanel {
                     .child(icon(if on { "check" } else { "x" }, 11., t.text_faint)),
             );
         }
+        if let Some(sel) = &self.selection {
+            let on = self.use_selection;
+            chips = chips.child(
+                div()
+                    .id("ai-selection")
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap(px(4.))
+                    .h(px(24.))
+                    .pl(px(6.))
+                    .pr(px(8.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if on { t.accent } else { t.border_strong })
+                    .bg(if on { t.accent_bg } else { gpui::transparent_black() })
+                    .text_size(px(12.))
+                    .text_color(if on { t.text_muted } else { t.text_faint })
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .opacity(if on { 1.0 } else { 0.55 })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.use_selection = !this.use_selection;
+                        cx.notify();
+                    }))
+                    .child(icon("quote", 12., t.text_faint))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(SharedString::from(sel.preview.clone())),
+                    )
+                    .child(icon(if on { "check" } else { "x" }, 11., t.text_faint)),
+            );
+        }
         let send = div()
             .id("ai-send")
             .flex()
@@ -718,28 +962,45 @@ impl AiPanel {
             }))
             .child(icon(if running { "stop" } else { "arrow-up" }, 15., if running { t.bg } else { gpui::white() }));
         let accent = t.accent;
+        let chip = |id: &'static str, icon_name: &'static str, label: String, color: gpui::Hsla, menu: ComposerMenu| {
+            let open = self.menu.is_some_and(|(m, _)| m == menu);
+            div()
+                .id(id)
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(4.))
+                .h(px(26.))
+                .px(px(6.))
+                .rounded(px(6.))
+                .text_size(px(12.))
+                .text_color(color)
+                .cursor_pointer()
+                .when(open, |d| d.bg(hover))
+                .hover(move |s| s.bg(hover))
+                .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
+                    this.menu = if this.menu.is_some_and(|(m, _)| m == menu) { None } else { Some((menu, ev.position())) };
+                    cx.notify();
+                }))
+                .child(icon(icon_name, 13., color))
+                .child(label)
+                .child(icon("chevron-down", 11., t.text_faint))
+        };
+        let model = label_of(&MODELS, s.state.ai_model.as_deref());
+        let effort = label_of(&EFFORTS, s.state.ai_effort.as_deref());
         let toggle = div()
-            .id("ai-allow")
             .flex()
             .items_center()
-            .gap(px(6.))
-            .h(px(26.))
-            .px(px(8.))
-            .ml(px(-6.))
-            .rounded(px(6.))
-            .text_size(px(12.))
-            .text_color(if allow { accent } else { t.text_faint })
-            .cursor_pointer()
-            .hover(move |s| s.bg(hover))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.store.update(cx, |s, cx| {
-                    s.state.ai_allow_edits = !s.state.ai_allow_edits;
-                    s.save_state();
-                    cx.notify();
-                })
-            }))
-            .child(icon("edit", 13., if allow { accent } else { t.text_faint }))
-            .child(if allow { "Can edit your pages" } else { "Read-only" });
+            .ml(px(-4.))
+            .child(chip(
+                "ai-access",
+                if allow { "edit" } else { "eye" },
+                if allow { "Can edit".into() } else { "Read-only".into() },
+                if allow { accent } else { t.text_faint },
+                ComposerMenu::Access,
+            ))
+            .child(chip("ai-model", "sparkle", model, t.text_faint, ComposerMenu::Model))
+            .child(chip("ai-effort", "clock", effort, t.text_faint, ComposerMenu::Effort));
         div()
             .flex_none()
             .px(px(12.))
@@ -805,5 +1066,6 @@ impl Render for AiPanel {
                     .child(list),
             )
             .child(self.render_composer(&t, cx))
+            .children(self.render_menu(&t, cx))
     }
 }
