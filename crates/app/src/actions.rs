@@ -61,6 +61,7 @@ actions!(
         ToggleSidebar,
         ToggleAi,
         QuickFind,
+        InsertLink,
         ToggleTheme,
         GoBack,
         GoForward,
@@ -121,6 +122,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-j", ToggleAi, None),
         KeyBinding::new("secondary-p", QuickFind, None),
         KeyBinding::new("secondary-k", QuickFind, None),
+        // with text selected in a page, ⌘K makes a link (like Notion)
+        KeyBinding::new("secondary-k", InsertLink, EDITOR),
         KeyBinding::new("secondary-shift-l", ToggleTheme, None),
         KeyBinding::new("secondary-[", GoBack, None),
         KeyBinding::new("secondary-]", GoForward, None),

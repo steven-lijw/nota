@@ -1481,6 +1481,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleAi, window, cx| this.toggle_ai(window, cx)))
             .on_action(cx.listener(|this, _: &QuickFind, window, cx| this.open_search(window, cx)))
+            // ⌘K in a page with nothing to link falls through to search
+            .on_action(cx.listener(|this, _: &InsertLink, window, cx| this.open_search(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| this.toggle_theme(cx)))
             .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| {
                 this.check_for_updates(cx);

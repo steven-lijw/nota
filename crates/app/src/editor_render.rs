@@ -3,7 +3,7 @@
 
 use crate::actions::*;
 use crate::blocks_view::{block_text, bullet_glyph, marker_box, top_margin};
-use crate::editor::{BlockMenu, DragBlock, Editor, EditorEvent, ResizeImage, Sel, INDENT_PX};
+use crate::editor::{lang_label, BlockMenu, BlockPicker, DragBlock, Editor, EditorEvent, ResizeImage, Sel, CODE_LANGS, INDENT_PX};
 use crate::theme::PAGE_MAX_W;
 use crate::text_view::{TextLayout, TextView};
 use crate::theme::{theme, ui_font, Theme};
@@ -384,31 +384,55 @@ impl Editor {
                             .cursor_pointer()
                             .hover(move |s| s.bg(hover))
                             .on_mouse_down(MouseButton::Left, stop)
-                            .on_click(cx.listener(move |this, _, _, cx| this.cycle_callout_icon(ix, cx)))
+                            .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
+                                this.picker = Some((ix, BlockPicker::CalloutIcon, ev.position()));
+                                cx.notify();
+                            }))
                             .child(SharedString::from(emoji.clone())),
                     )
                     .child(text)
                     .into_any_element()
             }
             BlockKind::Code { lang } => {
-                handle_offset = if lang.is_empty() { 16.0 } else { 30.0 };
-                let mut code = div()
+                handle_offset = 30.0;
+                let hover = t.hover;
+                let code_group: SharedString = format!("code-{id}").into();
+                div()
+                    .group(code_group.clone())
                     .flex_1()
                     .min_w_0()
                     .rounded(px(6.))
                     .bg(t.codeblock_bg)
                     .px(px(16.))
-                    .py(px(16.));
-                if !lang.is_empty() {
-                    code = code.pt(px(8.)).child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(t.text_faint)
-                            .pb(px(6.))
-                            .child(SharedString::from(lang.clone())),
-                    );
-                }
-                code.child(text).into_any_element()
+                    .pt(px(8.))
+                    .pb(px(16.))
+                    .child(
+                        div().flex().pb(px(6.)).child(
+                            div()
+                                .id(("code-lang", id as usize))
+                                .flex()
+                                .items_center()
+                                .gap(px(2.))
+                                .h(px(20.))
+                                .px(px(4.))
+                                .ml(px(-4.))
+                                .rounded(px(4.))
+                                .text_size(px(12.))
+                                .text_color(t.text_faint)
+                                .cursor_pointer()
+                                .when(lang.is_empty(), |d| d.opacity(0.).group_hover(code_group.clone(), |s| s.opacity(1.)))
+                                .hover(move |s| s.bg(hover))
+                                .on_mouse_down(MouseButton::Left, stop)
+                                .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
+                                    this.picker = Some((ix, BlockPicker::Language, ev.position()));
+                                    cx.notify();
+                                }))
+                                .child(SharedString::from(lang_label(lang).to_string()))
+                                .child(icon("chevron-down", 10., t.text_faint)),
+                        ),
+                    )
+                    .child(text)
+                    .into_any_element()
             }
             BlockKind::Divider => div()
                 .flex()
@@ -643,6 +667,144 @@ impl Editor {
         )
     }
 
+    /// The ⌘K link field, under the linked text.
+    fn render_link_editor(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let edit = self.link_edit.as_ref()?;
+        let layout = self.layout_of(edit.block)?;
+        let rect = layout.rects_for_range(edit.range.clone()).into_iter().last().unwrap_or(layout.caret_bounds(edit.range.end));
+        let mut menu = menu_surface(t).w(px(340.)).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .mx(px(8.))
+                .my(px(4.))
+                .px(px(8.))
+                .py(px(5.))
+                .rounded(px(6.))
+                .bg(t.hover)
+                .border_1()
+                .border_color(t.accent)
+                .child(icon("link", 14., t.text_faint))
+                .child(div().flex_1().min_w_0().child(edit.input.clone())),
+        );
+        menu = menu.child(
+            menu_item("link-apply", Some("check"), "Apply (Enter)", t)
+                .on_click(cx.listener(|this, _, window, cx| this.apply_link(window, cx))),
+        );
+        if edit.had_link {
+            menu = menu.child(
+                menu_item("link-remove", Some("trash"), "Remove link", t)
+                    .on_click(cx.listener(|this, _, window, cx| this.remove_link(window, cx))),
+            );
+        }
+        Some(popover(
+            point(rect.left(), rect.bottom() + px(6.)),
+            Corner::TopLeft,
+            menu,
+            cx.listener(|this, _, window, cx| {
+                this.link_edit = None;
+                window.focus(&this.focus);
+                cx.notify();
+            }),
+        ))
+    }
+
+    /// With the caret inside a link: show where it goes, with Open / Edit.
+    fn render_link_chip(&self, focused: bool, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !focused || self.link_edit.is_some() || self.block_sel.is_some() || !self.sel.range.is_empty() || self.slash.is_some() {
+            return None;
+        }
+        let ix = self.sel.block;
+        let (range, url) = self.link_at(ix, self.cursor())?;
+        let layout = self.layout_of(ix)?;
+        let caret = layout.caret_bounds(self.cursor());
+        let shown: String = url.chars().take(44).collect();
+        let shown = if url.chars().count() > 44 { format!("{shown}…") } else { shown };
+        let (open_url, edit_url) = (url.clone(), url.clone());
+        let chip = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .p(px(3.))
+            .pl(px(8.))
+            .bg(t.panel_bg)
+            .border_1()
+            .border_color(t.border)
+            .rounded(px(8.))
+            .shadow(popover_shadow(t))
+            .text_size(px(13.))
+            .child(icon("link", 13., t.text_faint))
+            .child(div().max_w(px(260.)).whitespace_nowrap().overflow_hidden().text_color(t.text_muted).child(SharedString::from(shown)))
+            .child(
+                text_button("link-open", "Open", t).on_click(cx.listener(move |_, _, _, cx| cx.open_url(&open_url))),
+            )
+            .child(text_button("link-edit", "Edit", t).on_click(cx.listener(move |this, _, window, cx| {
+                this.open_link_editor(ix, range.clone(), edit_url.clone(), window, cx)
+            })));
+        Some(
+            deferred(
+                anchored()
+                    .position(point(caret.left(), caret.bottom() + px(6.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(div().occlude().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(chip)),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// Code language list / callout emoji grid.
+    fn render_picker(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (ix, picker, pos) = self.picker?;
+        let block = self.blocks.get(ix)?;
+        let menu = match (picker, &block.kind) {
+            (BlockPicker::Language, BlockKind::Code { lang }) => {
+                let mut list = div().id("lang-list").flex().flex_col().max_h(px(320.)).overflow_y_scroll();
+                for (i, l) in CODE_LANGS.iter().enumerate() {
+                    let mut item = menu_item(("lang", i), None, lang_label(l).to_string(), t)
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_code_lang(ix, l, cx)));
+                    if lang == l {
+                        item = item.child(icon("check", 14., t.text_muted));
+                    }
+                    list = list.child(item);
+                }
+                menu_surface(t).w(px(200.)).child(menu_label("Language", t)).child(list)
+            }
+            (BlockPicker::CalloutIcon, BlockKind::Callout { .. }) => {
+                let mut grid = div().flex().flex_wrap().w(px(9. * 32.)).px(px(6.)).pb(px(6.));
+                for (i, e) in EMOJIS.iter().enumerate() {
+                    let hover = t.hover;
+                    grid = grid.child(
+                        div()
+                            .id(("callout-emoji", i))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(32.))
+                            .rounded(px(6.))
+                            .text_size(px(20.))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_callout_icon(ix, e, cx)))
+                            .child(*e),
+                    );
+                }
+                menu_surface(t).child(menu_label("Icon", t)).child(grid)
+            }
+            _ => return None,
+        };
+        Some(popover(
+            pos,
+            Corner::TopLeft,
+            menu,
+            cx.listener(|this, _, _, cx| {
+                this.picker = None;
+                cx.notify();
+            }),
+        ))
+    }
+
     fn render_slash_menu(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let slash = self.slash.as_ref()?;
         let layout = self.layout_of(slash.block)?;
@@ -733,7 +895,7 @@ impl Editor {
                 menu_item("bm-dup", Some("copy"), "Duplicate", t)
                     .on_click(cx.listener(move |this, _, _, cx| this.duplicate_block(ix, cx))),
             );
-        if self.blocks[ix].kind.has_text() {
+        if self.blocks[ix].kind.has_text() && !self.blocks[ix].kind.is_raw() || matches!(self.blocks[ix].kind, BlockKind::Code { .. }) {
             menu = menu
                 .child(menu_separator(t))
                 .child(menu_label("Turn into", t));
@@ -822,6 +984,20 @@ impl Editor {
             );
         }
         let hover = t.hover;
+        let has_link = self.link_at(self.sel.block, self.sel.range.start).is_some();
+        bar = bar.child(
+            div()
+                .id("fmt-link")
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(28.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .on_click(cx.listener(|this, _, window, cx| this.insert_link(&InsertLink, window, cx)))
+                .child(icon("link", 16., if has_link { t.accent } else { t.text })),
+        );
         bar = bar.child(div().w(px(1.)).h(px(18.)).mx(px(3.)).bg(t.border)).child(
             div()
                 .id("fmt-ai")
@@ -921,6 +1097,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::move_block_up))
             .on_action(cx.listener(Self::move_block_down))
             .on_action(cx.listener(Self::duplicate))
+            .on_action(cx.listener(Self::insert_link))
             .on_action(cx.listener(|this, _: &Bold, _, cx| this.toggle_mark(MarkKind::Bold, cx)))
             .on_action(cx.listener(|this, _: &Italic, _, cx| this.toggle_mark(MarkKind::Italic, cx)))
             .on_action(cx.listener(|this, _: &Underline, _, cx| this.toggle_mark(MarkKind::Underline, cx)))
@@ -1018,6 +1195,15 @@ impl Render for Editor {
         }
         if let Some(bar) = self.render_format_toolbar(focused, &t, cx) {
             col = col.child(bar);
+        }
+        if let Some(p) = self.render_link_editor(&t, cx) {
+            col = col.child(p);
+        }
+        if let Some(chip) = self.render_link_chip(focused, &t, cx) {
+            col = col.child(chip);
+        }
+        if let Some(p) = self.render_picker(&t, cx) {
+            col = col.child(p);
         }
         col
     }

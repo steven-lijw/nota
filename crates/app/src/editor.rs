@@ -4,6 +4,7 @@
 use crate::actions::*;
 use crate::edit::*;
 use crate::store::Store;
+use gpui::AppContext;
 use crate::text_view::TextLayout;
 use gpui::{
     point, px, App, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, EventEmitter,
@@ -184,6 +185,56 @@ pub fn is_image_path(p: &std::path::Path) -> bool {
     p.extension().is_some_and(|e| IMAGE_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
 }
 
+/// Languages offered for code blocks (stored as written here, lower-case).
+pub const CODE_LANGS: [&str; 22] = [
+    "", "bash", "c", "cpp", "csharp", "css", "go", "html", "java", "javascript", "json", "kotlin",
+    "markdown", "php", "python", "ruby", "rust", "sql", "swift", "typescript", "yaml", "toml",
+];
+
+pub fn lang_label(lang: &str) -> &str {
+    match lang {
+        "" => "Plain text",
+        "bash" | "sh" | "shell" | "zsh" => "Shell",
+        "c" => "C",
+        "cpp" | "c++" => "C++",
+        "csharp" | "cs" => "C#",
+        "css" => "CSS",
+        "go" => "Go",
+        "html" => "HTML",
+        "java" => "Java",
+        "javascript" | "js" => "JavaScript",
+        "json" => "JSON",
+        "kotlin" => "Kotlin",
+        "markdown" | "md" => "Markdown",
+        "php" => "PHP",
+        "python" | "py" => "Python",
+        "ruby" | "rb" => "Ruby",
+        "rust" | "rs" => "Rust",
+        "sql" => "SQL",
+        "swift" => "Swift",
+        "typescript" | "ts" => "TypeScript",
+        "yaml" | "yml" => "YAML",
+        "toml" => "TOML",
+        other => other,
+    }
+}
+
+/// The ⌘K link editor.
+pub struct LinkEdit {
+    pub block: usize,
+    pub range: Range<usize>,
+    pub input: Entity<crate::text_input::TextInput>,
+    pub had_link: bool,
+    _sub: Subscription,
+}
+
+/// Small pickers attached to one block.
+#[derive(Clone, Copy, PartialEq)]
+pub enum BlockPicker {
+    Language,
+    CalloutIcon,
+}
+
 pub const INDENT_PX: f32 = 24.0;
 const GUTTER_PX: f32 = 50.0;
 
@@ -214,6 +265,9 @@ pub struct Editor {
     /// Blocks being dragged (dimmed while the drag lasts).
     pub(crate) drag_range: Option<Range<usize>>,
     pub(crate) marquee: Option<Marquee>,
+    pub(crate) link_edit: Option<LinkEdit>,
+    /// (block, picker, where it opens)
+    pub(crate) picker: Option<(usize, BlockPicker, Point<Pixels>)>,
     last_mouse: Option<Point<Pixels>>,
     /// Image natural sizes in pixels, by file.
     pub(crate) image_dims: RefCell<HashMap<std::path::PathBuf, Option<(u32, u32)>>>,
@@ -281,6 +335,8 @@ impl Editor {
             drop_target: None,
             drag_range: None,
             marquee: None,
+            link_edit: None,
+            picker: None,
             last_mouse: None,
             image_dims: RefCell::new(HashMap::new()),
             resize_start: None,
@@ -492,6 +548,123 @@ impl Editor {
     fn close_popups(&mut self) {
         self.slash = None;
         self.block_menu = None;
+        self.link_edit = None;
+        self.picker = None;
+    }
+
+    // ----------------------------------------------------------------------
+    // links and block pickers
+    // ----------------------------------------------------------------------
+
+    /// The link around `offset` in block `ix`: its range and URL.
+    pub(crate) fn link_at(&self, ix: usize, offset: usize) -> Option<(Range<usize>, String)> {
+        let text = &self.blocks.get(ix)?.text;
+        // merge neighbouring runs that carry the same link
+        let mut links: Vec<(Range<usize>, String)> = Vec::new();
+        for (r, m) in text.segments() {
+            let Some(url) = &m.link else { continue };
+            match links.last_mut() {
+                Some((lr, lu)) if lr.end == r.start && lu == url => lr.end = r.end,
+                _ => links.push((r.clone(), url.clone())),
+            }
+        }
+        links.into_iter().find(|(r, _)| !r.is_empty() && r.start <= offset && offset <= r.end)
+    }
+
+    pub(crate) fn insert_link(&mut self, _: &InsertLink, window: &mut Window, cx: &mut Context<Self>) {
+        if self.block_sel.is_some() || !self.cur().kind.has_text() || self.cur().kind.is_raw() {
+            cx.propagate();
+            return;
+        }
+        let ix = self.sel.block;
+        let (range, url) = if self.sel.range.is_empty() {
+            match self.link_at(ix, self.cursor()) {
+                Some(found) => found,
+                None => {
+                    cx.propagate(); // nothing to link: ⌘K searches
+                    return;
+                }
+            }
+        } else {
+            let r = self.sel.range.clone();
+            let url = self.link_at(ix, r.start).filter(|(lr, _)| lr.start <= r.start && r.end <= lr.end).map(|l| l.1);
+            (r, url.unwrap_or_default())
+        };
+        self.open_link_editor(ix, range, url, window, cx);
+    }
+
+    pub(crate) fn open_link_editor(&mut self, ix: usize, range: Range<usize>, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::text_input::{InputEvent, TextInput};
+        let had_link = !url.is_empty();
+        let input = cx.new(|cx| {
+            let mut i = TextInput::new(window, cx);
+            i.placeholder = "Paste or type a link…".into();
+            i.set_text(url, cx);
+            i.select_all_text(cx);
+            i
+        });
+        input.read(cx).focus(window);
+        let sub = cx.subscribe_in(&input, window, |this: &mut Self, _, ev: &InputEvent, window, cx| match ev {
+            InputEvent::Submit => this.apply_link(window, cx),
+            InputEvent::Cancel => {
+                this.link_edit = None;
+                window.focus(&this.focus);
+                cx.notify();
+            }
+            _ => {}
+        });
+        self.sel = Sel { block: ix, range: range.clone(), reversed: false };
+        self.link_edit = Some(LinkEdit { block: ix, range, input, had_link, _sub: sub });
+        cx.notify();
+    }
+
+    /// Apply the URL typed in the link editor (empty removes the link).
+    pub(crate) fn apply_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.link_edit.take() else { return };
+        let url = edit.input.read(cx).text().trim().to_string();
+        if edit.block < self.blocks.len() {
+            let len = self.blocks[edit.block].text.len();
+            let r = edit.range.start.min(len)..edit.range.end.min(len);
+            self.checkpoint(EditKind::Other);
+            let url = (!url.is_empty()).then(|| {
+                if url.contains("://") || url.starts_with("mailto:") { url } else { format!("https://{url}") }
+            });
+            self.blocks[edit.block].text.set_link(r.clone(), url);
+            self.sel = Sel::caret(edit.block, r.end);
+            self.after_edit(cx);
+        }
+        window.focus(&self.focus);
+    }
+
+    pub(crate) fn remove_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(edit) = &self.link_edit {
+            edit.input.update(cx, |i, cx| i.set_text("", cx));
+        }
+        self.apply_link(window, cx);
+    }
+
+    pub(crate) fn set_code_lang(&mut self, ix: usize, lang: &str, cx: &mut Context<Self>) {
+        self.picker = None;
+        if let Some(BlockKind::Code { lang: l }) = self.blocks.get_mut(ix).map(|b| &mut b.kind) {
+            if l != lang {
+                *l = lang.to_string();
+                self.checkpoint(EditKind::Other);
+                self.after_edit(cx);
+                return;
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn set_callout_icon(&mut self, ix: usize, emoji: &str, cx: &mut Context<Self>) {
+        self.picker = None;
+        if let Some(BlockKind::Callout { icon }) = self.blocks.get_mut(ix).map(|b| &mut b.kind) {
+            *icon = emoji.to_string();
+            self.checkpoint(EditKind::Other);
+            self.after_edit(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     // ----------------------------------------------------------------------
