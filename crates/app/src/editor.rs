@@ -70,6 +70,7 @@ pub enum SlashAction {
     Turn(BlockKind),
     Page,
     Database,
+    Image,
 }
 
 pub struct SlashItem {
@@ -103,6 +104,7 @@ pub fn slash_items() -> Vec<SlashItem> {
         item("Quote", "\"", "quote", "quote blockquote 引用 yinyong", SlashAction::Turn(Quote)),
         item("Divider", "---", "divider", "divider line hr 分割线 fengexian", SlashAction::Turn(Divider)),
         item("Code", "```", "code", "code snippet 代码 daima", SlashAction::Turn(Code { lang: String::new() })),
+        item("Image", "", "image", "image picture photo screenshot 图片 截图 tupian", SlashAction::Image),
         item("Database", "", "database", "database table board 数据库 表格 看板 shujuku", SlashAction::Database),
     ]
 }
@@ -148,6 +150,21 @@ pub struct Marquee {
     pub from_tail: bool,
 }
 
+/// Dragging one of an image's side handles.
+#[derive(Clone)]
+pub struct ResizeImage {
+    pub id: u64,
+    /// -1 for the left handle, 1 for the right one.
+    pub side: f32,
+}
+
+/// Image file types that can be dropped or pasted into a page.
+pub const IMAGE_EXTS: [&str; 9] = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "tif", "tiff"];
+
+pub fn is_image_path(p: &std::path::Path) -> bool {
+    p.extension().is_some_and(|e| IMAGE_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
+}
+
 pub const INDENT_PX: f32 = 24.0;
 const GUTTER_PX: f32 = 50.0;
 
@@ -179,6 +196,10 @@ pub struct Editor {
     pub(crate) drag_range: Option<Range<usize>>,
     pub(crate) marquee: Option<Marquee>,
     last_mouse: Option<Point<Pixels>>,
+    /// Image natural sizes in pixels, by file.
+    pub(crate) image_dims: RefCell<HashMap<std::path::PathBuf, Option<(u32, u32)>>>,
+    /// (image block id, pointer x and width when the resize started)
+    resize_start: Option<(u64, Pixels, f32)>,
     autoscrolling: bool,
     _autoscroll: Option<Task<()>>,
     _subs: Vec<Subscription>,
@@ -242,6 +263,8 @@ impl Editor {
             drag_range: None,
             marquee: None,
             last_mouse: None,
+            image_dims: RefCell::new(HashMap::new()),
+            resize_start: None,
             autoscrolling: false,
             _autoscroll: None,
             _subs: subs,
@@ -700,6 +723,24 @@ impl Editor {
                 }
                 self.after_edit(cx);
             }
+            SlashAction::Image => {
+                self.after_edit(cx);
+                let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple: true,
+                    prompt: Some("Insert".into()),
+                });
+                cx.spawn_in(window, async move |this, cx| {
+                    let Ok(Ok(Some(paths))) = paths.await else { return };
+                    this.update_in(cx, |this, window, cx| {
+                        this.drop_target = None;
+                        this.drop_files(&paths, window, cx)
+                    })
+                    .ok();
+                })
+                .detach();
+            }
             SlashAction::Page | SlashAction::Database => {
                 let kind = if matches!(item.action, SlashAction::Database) {
                     PageKind::Database
@@ -820,6 +861,10 @@ impl Editor {
         self.blocks.iter().position(|b| b.id == id)
     }
 
+    pub(crate) fn index_of_block(&self, id: u64) -> Option<usize> {
+        self.index_of(id)
+    }
+
     /// Visible blocks that have been laid out, with their row bounds, top to bottom.
     fn visible_rows(&self) -> Vec<(usize, Bounds<Pixels>)> {
         let vis = visibility(&self.blocks);
@@ -915,6 +960,150 @@ impl Editor {
         if !cx.has_active_drag() {
             self.drop_target = None;
             self.drag_range = None;
+            self.resize_start = None;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // images
+    // ----------------------------------------------------------------------
+
+    /// Natural pixel size of an image file (cached; reads only the header).
+    pub(crate) fn image_size(&self, path: &std::path::Path) -> Option<(u32, u32)> {
+        if let Some(d) = self.image_dims.borrow().get(path) {
+            return *d;
+        }
+        let d = image::image_dimensions(path).ok();
+        self.image_dims.borrow_mut().insert(path.to_path_buf(), d);
+        d
+    }
+
+    /// Insert image blocks (vault-root-relative paths) at `target`, or after
+    /// the current block. The new images end up selected.
+    fn insert_images(&mut self, assets: Vec<(String, String)>, target: Option<DropTarget>, cx: &mut Context<Self>) {
+        if assets.is_empty() {
+            return;
+        }
+        let page = self.page_id.clone();
+        let make = |s: &Store, indent: u8, (rel, alt): &(String, String)| {
+            Block::new(BlockKind::Image { src: s.vault.src_for_page(&page, rel), width: None }, alt.as_str())
+                .with_indent(indent)
+        };
+        self.checkpoint(EditKind::Other);
+        let (mut at, indent) = match target {
+            Some(t) => (t.gap.min(self.blocks.len()), t.indent),
+            None => {
+                let ix = self.sel.block.min(self.blocks.len() - 1);
+                let b = &self.blocks[ix];
+                if b.kind == BlockKind::Paragraph && b.text.is_empty() {
+                    // replace the empty line the caret is on
+                    let indent = b.indent;
+                    self.blocks.remove(ix);
+                    (ix, indent)
+                } else {
+                    (subtree_end(&self.blocks, ix), b.indent)
+                }
+            }
+        };
+        let store = self.store.read(cx);
+        let new: Vec<Block> = assets.iter().map(|a| make(store, indent, a)).collect();
+        let n = new.len();
+        let start = at;
+        for b in new {
+            self.blocks.insert(at, b);
+            at += 1;
+        }
+        if at == self.blocks.len() {
+            // keep somewhere to type after an image at the end of the page
+            self.blocks.push(Block::paragraph("").with_indent(0));
+        }
+        self.block_sel = Some((start, start + n - 1));
+        self.sel = Sel::caret(start, 0);
+        self.close_popups();
+        self.after_edit(cx);
+    }
+
+    /// Files dragged in from Finder (or a screenshot thumbnail).
+    pub(crate) fn drop_files(&mut self, paths: &[std::path::PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.drop_target.take();
+        let images: Vec<&std::path::PathBuf> = paths.iter().filter(|p| is_image_path(p)).collect();
+        if images.is_empty() {
+            self.store.update(cx, |s, cx| {
+                s.last_error = Some("Only image files can be dropped into a page.".into());
+                cx.notify();
+            });
+            return;
+        }
+        let mut assets = Vec::new();
+        for p in images {
+            let alt = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            match self.store.read(cx).vault.import_asset(p) {
+                Ok(rel) => assets.push((rel, alt)),
+                Err(err) => self.store.update(cx, |s, cx| {
+                    s.last_error = Some(format!("Could not add the image: {err:#}"));
+                    cx.notify();
+                }),
+            }
+        }
+        window.focus(&self.focus);
+        self.insert_images(assets, target, cx);
+    }
+
+    pub(crate) fn files_dragged(&mut self, pos: Point<Pixels>, inside: bool, cx: &mut Context<Self>) {
+        self.last_mouse = Some(pos);
+        // nothing moves: use a range that contains no block
+        let target = if inside { self.drop_target_at(pos, &(usize::MAX..usize::MAX)) } else { None };
+        if self.drop_target != target {
+            self.drop_target = target;
+            cx.notify();
+        }
+        self.ensure_autoscroll(cx);
+    }
+
+    /// Paste an image from the clipboard (e.g. a screenshot taken with ⌃⇧⌘4).
+    /// Returns false when the clipboard holds no image.
+    fn paste_image(&mut self, item: &gpui::ClipboardItem, cx: &mut Context<Self>) -> bool {
+        let image = item.entries().iter().find_map(|e| match e {
+            gpui::ClipboardEntry::Image(img) => Some(img),
+            _ => None,
+        });
+        let Some(image) = image else { return false };
+        use gpui::ImageFormat as F;
+        let ext = match image.format {
+            F::Png => "png",
+            F::Jpeg => "jpg",
+            F::Webp => "webp",
+            F::Gif => "gif",
+            F::Svg => "svg",
+            F::Bmp => "bmp",
+            F::Tiff => "tiff",
+        };
+        let name = format!("Pasted image {}", chrono::Local::now().format("%Y-%m-%d %H.%M.%S"));
+        match self.store.read(cx).vault.add_asset(&name, ext, &image.bytes) {
+            Ok(rel) => self.insert_images(vec![(rel, String::new())], None, cx),
+            Err(err) => self.store.update(cx, |s, cx| {
+                s.last_error = Some(format!("Could not save the image: {err:#}"));
+                cx.notify();
+            }),
+        }
+        true
+    }
+
+    pub(crate) fn start_resize(&mut self, id: u64, x: Pixels, width: f32) {
+        self.checkpoint(EditKind::Other);
+        self.resize_start = Some((id, x, width));
+    }
+
+    pub(crate) fn resize_moved(&mut self, drag: &ResizeImage, x: Pixels, max: f32, cx: &mut Context<Self>) {
+        let Some((id, start_x, start_w)) = self.resize_start.filter(|r| r.0 == drag.id) else { return };
+        let Some(ix) = self.index_of(id) else { return };
+        // images are centred, so each side moves by half the change
+        let w = (start_w + 2.0 * drag.side * ((x - start_x) / px(1.))).clamp(48.0, max).round() as u32;
+        if let BlockKind::Image { width, .. } = &mut self.blocks[ix].kind {
+            if *width != Some(w) {
+                *width = Some(w);
+                self.after_edit(cx);
+            }
         }
     }
 
@@ -1832,10 +2021,25 @@ impl Editor {
         }
     }
 
-    pub(crate) fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+    pub(crate) fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
             return;
         };
+        let text = item.text();
+        if text.is_none() && self.paste_image(&item, cx) {
+            return;
+        }
+        let Some(text) = text else {
+            return;
+        };
+        // a copied image file (path or file:// URL)
+        let as_path = text.trim().strip_prefix("file://").map(|p| nota_core::markdown::decode_url(p)).unwrap_or_else(|| text.trim().to_string());
+        let path = std::path::PathBuf::from(&as_path);
+        if !as_path.contains('\n') && path.is_absolute() && is_image_path(&path) && path.is_file() {
+            self.drop_target = None;
+            self.drop_files(&[path], window, cx);
+            return;
+        }
         let text = text.replace("\r\n", "\n");
         if text.is_empty() {
             return;

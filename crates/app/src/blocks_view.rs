@@ -244,6 +244,11 @@ fn static_block(blocks: &[Block], ix: usize, t: &Theme, base: f32) -> AnyElement
             .child(icon("page", 16., t.text_muted))
             .child(div().pl(px(6.)).child(bt.text))
             .into_any_element(),
+        BlockKind::Image { src, .. } => row
+            .text_color(t.text_muted)
+            .child(icon("image", 16., t.text_muted))
+            .child(div().pl(px(6.)).child(SharedString::from(src.clone())))
+            .into_any_element(),
         _ => row.child(text).into_any_element(),
     }
 }

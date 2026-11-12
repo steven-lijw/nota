@@ -33,12 +33,16 @@ pub enum BlockKind {
     Code { lang: String },
     /// Link to a sub-page; `text` caches the page title.
     PageLink { page: String },
+    /// An image file; `text` holds the alt text. `src` is relative to the
+    /// page's file (normally `assets/…`), `width` is the display width in
+    /// points (`None`: natural size, at most the column width).
+    Image { src: String, width: Option<u32> },
 }
 
 impl BlockKind {
     /// Whether the block holds editable text.
     pub fn has_text(&self) -> bool {
-        !matches!(self, BlockKind::Divider | BlockKind::PageLink { .. })
+        !matches!(self, BlockKind::Divider | BlockKind::PageLink { .. } | BlockKind::Image { .. })
     }
 
     pub fn is_list(&self) -> bool {
@@ -63,6 +67,7 @@ impl BlockKind {
             BlockKind::Divider => "Divider",
             BlockKind::Code { .. } => "Code",
             BlockKind::PageLink { .. } => "Page",
+            BlockKind::Image { .. } => "Image",
         }
     }
 }

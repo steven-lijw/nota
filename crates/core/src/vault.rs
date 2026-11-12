@@ -25,6 +25,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+/// Folder (inside the vault) where pasted and dropped images are kept.
+pub const ASSETS_DIR: &str = "assets";
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -506,6 +509,83 @@ impl Vault {
             .map(|f| self.root.join(f))
     }
 
+    /// Store image bytes in `<vault>/assets/`; returns the path relative to the vault root.
+    pub fn add_asset(&self, name_hint: &str, ext: &str, bytes: &[u8]) -> Result<String> {
+        let dir = self.root.join(ASSETS_DIR);
+        std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        let stem = sanitize_file_name(name_hint);
+        let id = new_id();
+        let name = format!("{} {}.{}", stem, &id[..8], ext.trim_start_matches('.').to_lowercase());
+        std::fs::write(dir.join(&name), bytes).with_context(|| format!("writing {name}"))?;
+        Ok(format!("{ASSETS_DIR}/{name}"))
+    }
+
+    /// Bring a file into the vault: files already inside it are used where
+    /// they are, others are copied into `assets/`. Returns the root-relative path.
+    pub fn import_asset(&self, path: &Path) -> Result<String> {
+        if let (Ok(root), Ok(abs)) = (self.root.canonicalize(), path.canonicalize()) {
+            if let Ok(rel) = abs.strip_prefix(&root) {
+                return Ok(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "image".into());
+        let ext = path.extension().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "png".into());
+        self.add_asset(&stem, &ext, &bytes)
+    }
+
+    /// Turn a root-relative asset path into the `src` written in a page's
+    /// Markdown (relative to the page's file, so other editors find it too).
+    pub fn src_for_page(&self, page_id: &str, root_rel: &str) -> String {
+        let depth = self
+            .pages
+            .get(page_id)
+            .and_then(|p| p.file.as_ref())
+            .and_then(|f| f.parent())
+            .map_or(0, |d| d.components().count());
+        format!("{}{}", "../".repeat(depth), root_rel)
+    }
+
+    /// Where an image `src` of a page lives on disk (`None` for web URLs).
+    pub fn resolve_src(&self, page_id: &str, src: &str) -> Option<PathBuf> {
+        if src.contains("://") {
+            return None;
+        }
+        let p = Path::new(src);
+        if p.is_absolute() {
+            return Some(p.to_path_buf());
+        }
+        let dir = self
+            .pages
+            .get(page_id)
+            .and_then(|pg| pg.file.as_ref())
+            .and_then(|f| f.parent())
+            .map(|d| self.root.join(d))
+            .unwrap_or_else(|| self.root.clone());
+        // resolve `..` without touching the disk (the folders may not exist)
+        let normalize = |path: PathBuf| {
+            let mut out = PathBuf::new();
+            for c in path.components() {
+                match c {
+                    std::path::Component::ParentDir => {
+                        out.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => out.push(other),
+                }
+            }
+            out
+        };
+        let near = normalize(dir.join(p));
+        if near.exists() {
+            return Some(near);
+        }
+        // fall back to the vault root (e.g. the page file was moved)
+        let rel: PathBuf = p.components().filter(|c| !matches!(c, std::path::Component::ParentDir)).collect();
+        let at_root = self.root.join(rel);
+        Some(if at_root.exists() { at_root } else { near })
+    }
+
     /// Write one page to disk (atomically), renaming the file if the title changed.
     pub fn save_page(&mut self, id: &str) -> Result<()> {
         let root = self.root.clone();
@@ -722,6 +802,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nota-test-{}-{}", name, new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn assets() {
+        let dir = temp_dir("assets");
+        let mut vault = Vault { root: dir.clone(), pages: HashMap::new() };
+        let rel = vault.add_asset("Screen Shot: 1", "PNG", b"png").unwrap();
+        assert!(rel.starts_with("assets/Screen Shot 1 ") && rel.ends_with(".png"));
+        assert_eq!(vault.import_asset(&dir.join(&rel)).unwrap(), rel);
+        let id = vault.create_page(PageKind::Page, None);
+        vault.page_mut(&id).unwrap().file = Some(PathBuf::from("notes/sub/p.md"));
+        assert_eq!(vault.src_for_page(&id, &rel), format!("../../{rel}"));
+        let src = vault.src_for_page(&id, &rel);
+        assert_eq!(vault.resolve_src(&id, &src).unwrap().canonicalize().unwrap(), dir.join(&rel).canonicalize().unwrap());
+        assert!(vault.resolve_src(&id, "https://x/y.png").is_none());
     }
 
     #[test]

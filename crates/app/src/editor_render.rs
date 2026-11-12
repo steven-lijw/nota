@@ -3,14 +3,15 @@
 
 use crate::actions::*;
 use crate::blocks_view::{block_text, bullet_glyph, marker_box, top_margin};
-use crate::editor::{BlockMenu, DragBlock, Editor, EditorEvent, Sel, INDENT_PX};
+use crate::editor::{BlockMenu, DragBlock, Editor, EditorEvent, ResizeImage, Sel, INDENT_PX};
+use crate::theme::PAGE_MAX_W;
 use crate::text_view::{TextLayout, TextView};
 use crate::theme::{theme, ui_font, Theme};
 use crate::ui::*;
 use gpui::{
-    anchored, canvas, deferred, div, font, point, prelude::*, px, AnyElement, Context, Corner,
-    DispatchPhase, DragMoveEvent, ElementInputHandler, FontWeight, Hsla, MouseButton, MouseMoveEvent,
-    MouseUpEvent, SharedString, TextRun, Window,
+    anchored, canvas, deferred, div, font, img, point, prelude::*, px, AnyElement, Context, Corner,
+    DispatchPhase, DragMoveEvent, ElementInputHandler, ExternalPaths, FontWeight, Hsla, MouseButton,
+    MouseMoveEvent, MouseUpEvent, SharedString, TextRun, Window,
 };
 use nota_core::{list_number, visibility, Block, BlockKind, MarkKind};
 use std::collections::HashSet;
@@ -23,6 +24,15 @@ const BASE: f32 = 16.0;
 
 pub struct DragPreview {
     label: SharedString,
+}
+
+/// Nothing follows the pointer while an image is resized.
+pub struct NoPreview;
+
+impl Render for NoPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
 }
 
 impl Render for DragPreview {
@@ -90,7 +100,110 @@ impl Editor {
         cx.notify();
     }
 
-    fn render_block(&self, ix: usize, last_visible: bool, focused: bool, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// Widest an image may be in this block's column.
+    fn column_width(&self, ix: usize) -> f32 {
+        let b = &self.blocks[ix];
+        let indent = b.indent as f32 * INDENT;
+        self.row_bounds
+            .borrow()
+            .get(&b.id)
+            .map(|r| r.size.width / px(1.) - 2. * GUTTER - indent)
+            .unwrap_or(PAGE_MAX_W - indent)
+            .max(80.)
+    }
+
+    fn render_image(&self, ix: usize, src: &str, width: Option<u32>, scale: f32, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let id = self.blocks[ix].id;
+        let path = self.store.read(cx).vault.resolve_src(&self.page_id, src);
+        let Some(path) = path.filter(|p| p.is_file()) else {
+            return div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .gap(px(8.))
+                .h(px(44.))
+                .px(px(12.))
+                .rounded(px(4.))
+                .bg(t.hover)
+                .text_size(px(14.))
+                .text_color(t.text_faint)
+                .child(icon("image", 16., t.text_faint))
+                .child(SharedString::from(format!("Image not found: {src}")))
+                .into_any_element();
+        };
+        let max = self.column_width(ix);
+        let natural = self.image_size(&path).map(|(w, _)| w as f32 / scale.max(1.));
+        let w = width.map(|w| w as f32).or(natural).unwrap_or(max).min(max).max(48.);
+        let group: SharedString = format!("img-{id}").into();
+        let stop = |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| cx.stop_propagation();
+        let handle = |side: f32| {
+            let mut h = div()
+                .id(if side < 0. { ("img-l", id as usize) } else { ("img-r", id as usize) })
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .w(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_ew_resize()
+                .opacity(0.)
+                .group_hover(group.clone(), |s| s.opacity(1.))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.start_resize(id, ev.position.x, w);
+                    }),
+                )
+                .on_drag(ResizeImage { id, side }, |_, _, _, cx| cx.new(|_| NoPreview))
+                .child(
+                    div()
+                        .w(px(6.))
+                        .h(px(48.).min(px(w * 0.4)))
+                        .rounded(px(3.))
+                        .bg(Hsla { a: 0.6, ..gpui::black() })
+                        .border_1()
+                        .border_color(Hsla { a: 0.9, ..gpui::white() }),
+                );
+            h = if side < 0. { h.left(px(2.)) } else { h.right(px(2.)) };
+            h
+        };
+        let faint = t.text_faint;
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .justify_center()
+            .py(px(4.))
+            .child(
+                div()
+                    .id(("img", id as usize))
+                    .group(group.clone())
+                    .relative()
+                    .w(px(w))
+                    .on_mouse_down(MouseButton::Right, stop)
+                    .child(
+                        img(path)
+                            .w(px(w))
+                            .rounded(px(3.))
+                            .with_fallback(move || {
+                                div()
+                                    .h(px(44.))
+                                    .flex()
+                                    .items_center()
+                                    .text_color(faint)
+                                    .child("This image could not be shown")
+                                    .into_any_element()
+                            }),
+                    )
+                    .child(handle(-1.))
+                    .child(handle(1.)),
+            )
+            .into_any_element()
+    }
+
+    fn render_block(&self, ix: usize, last_visible: bool, focused: bool, scale: f32, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let block: &Block = &self.blocks[ix];
         let id = block.id;
         let bt = block_text(block, t, BASE);
@@ -346,6 +459,10 @@ impl Editor {
                         .child("Deleted page")
                         .into_any_element(),
                 }
+            }
+            BlockKind::Image { src, width } => {
+                let (src, width) = (src.clone(), *width);
+                self.render_image(ix, &src, width, scale, t, cx)
             }
             _ => text.into_any_element(),
         };
@@ -708,6 +825,7 @@ impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
         let focused = self.focus.is_focused(window);
+        let scale = window.scale_factor();
         let vis = visibility(&self.blocks);
 
         // forget layouts of blocks that no longer exist
@@ -792,12 +910,25 @@ impl Render for Editor {
                 let inside = ev.bounds.contains(&pos) && this.scroll.bounds().contains(&pos);
                 this.drag_moved(&drag, pos, inside, cx);
             }))
-            .on_drop(cx.listener(|this, drag: &DragBlock, _, cx| this.drop_dragged(drag, cx)));
+            .on_drop(cx.listener(|this, drag: &DragBlock, _, cx| this.drop_dragged(drag, cx)))
+            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<ExternalPaths>, _, cx| {
+                let pos = ev.event.position;
+                let inside = ev.bounds.contains(&pos) && this.scroll.bounds().contains(&pos);
+                this.files_dragged(pos, inside, cx);
+            }))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.drop_files(paths.paths(), window, cx)
+            }))
+            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<ResizeImage>, _, cx| {
+                let drag = ev.drag(cx).clone();
+                let max = this.index_of_block(drag.id).map_or(PAGE_MAX_W, |ix| this.column_width(ix));
+                this.resize_moved(&drag, ev.event.position.x, max, cx);
+            }));
 
         let last_vis = (0..self.blocks.len()).rev().find(|&i| vis[i]);
         for ix in 0..self.blocks.len() {
             if vis[ix] {
-                col = col.child(self.render_block(ix, Some(ix) == last_vis, focused, &t, cx));
+                col = col.child(self.render_block(ix, Some(ix) == last_vis, focused, scale, &t, cx));
             }
         }
 

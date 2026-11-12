@@ -42,6 +42,43 @@ fn encode_url(url: &str) -> String {
     url.replace(' ', "%20").replace('(', "%28").replace(')', "%29")
 }
 
+/// Undo `%XX` escapes (for local file paths in image links).
+pub fn decode_url(url: &str) -> String {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let bytes = url.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| url.to_string())
+}
+
+/// A line that is just `![alt](src)` (Obsidian-style `![alt|400](src)` sets a
+/// width). Returns the byte length of the alt text, the decoded source and the width.
+fn parse_image_line(content: &str) -> Option<(usize, String, Option<u32>)> {
+    let rest = content.strip_prefix("![")?.strip_suffix(')')?;
+    let (alt, src) = rest.split_once("](")?;
+    let spaced = src.contains(char::is_whitespace) && !src.starts_with('<');
+    if alt.contains(']') || src.is_empty() || spaced {
+        return None;
+    }
+    let src = src.strip_prefix('<').and_then(|s| s.strip_suffix('>')).unwrap_or(src);
+    let (alt, width) = match alt.rsplit_once('|') {
+        Some((a, w)) if !w.is_empty() && w.chars().all(|c| c.is_ascii_digit()) => (a, w.parse().ok()),
+        _ => (alt, None),
+    };
+    Some((alt.len(), decode_url(src), width))
+}
+
 fn push_code_span(text: &str, out: &mut String) {
     let mut longest = 0;
     let mut cur = 0;
@@ -452,6 +489,9 @@ fn classify(content: &str) -> (BlockKind, &str) {
             }
         }
     }
+    if let Some((alt_len, src, width)) = parse_image_line(content) {
+        return (BlockKind::Image { src, width }, &content[2..2 + alt_len]);
+    }
     // headings
     let hashes = content.chars().take_while(|c| *c == '#').count();
     if (1..=6).contains(&hashes) {
@@ -656,6 +696,18 @@ pub fn to_markdown(blocks: &[Block]) -> String {
                 out.push_str(&pad);
                 out.push_str(&format!("[[{}|{}]]", page, title.trim()));
             }
+            BlockKind::Image { src, width } => {
+                let alt = b.text.text.replace(['[', ']', '|', '\n'], " ");
+                out.push_str(&pad);
+                out.push_str("![");
+                out.push_str(alt.trim());
+                if let Some(w) = width {
+                    out.push_str(&format!("|{w}"));
+                }
+                out.push_str("](");
+                out.push_str(&encode_url(src));
+                out.push(')');
+            }
         }
         prev_indent = indent as i32;
         prev_listish = is_listish(&b.kind);
@@ -780,7 +832,7 @@ pub fn from_markdown(src: &str) -> Vec<Block> {
         }
 
         let (kind, text) = classify(content);
-        let no_text = matches!(kind, BlockKind::Divider | BlockKind::PageLink { .. });
+        let no_text = matches!(kind, BlockKind::Divider | BlockKind::PageLink { .. } | BlockKind::Image { .. });
         let (text, cont) = if no_text {
             (text, false)
         } else {
@@ -829,7 +881,7 @@ pub fn from_markdown(src: &str) -> Vec<Block> {
         .into_iter()
         .map(|p| {
             let text = match p.kind {
-                BlockKind::Code { .. } | BlockKind::PageLink { .. } => RichText::plain(p.raw),
+                BlockKind::Code { .. } | BlockKind::PageLink { .. } | BlockKind::Image { .. } => RichText::plain(p.raw),
                 BlockKind::Divider => RichText::default(),
                 _ => inline_from_md(&p.raw),
             };
@@ -953,6 +1005,8 @@ mod tests {
                 "callout\nmore",
             ),
             Block::new(BlockKind::Divider, ""),
+            Block::new(BlockKind::Image { src: "assets/Screen Shot (1).png".into(), width: None }, "shot"),
+            Block::new(BlockKind::Image { src: "assets/b.png".into(), width: Some(420) }, ""),
             Block::new(
                 BlockKind::Code {
                     lang: "rust".into(),
@@ -1013,5 +1067,26 @@ mod tests {
         assert_eq!(blocks[1].text.text, "First line second line.");
         assert_eq!(blocks[7].text.text, "careful");
         assert_eq!(blocks[8].text.text, "print(1)");
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn image_lines() {
+        let b = from_markdown("![shot](assets/a%20b.png)\n\n![w|300](<x y.png>)\n\ntext ![i](j.png)\n");
+        assert_eq!(b[0].kind, BlockKind::Image { src: "assets/a b.png".into(), width: None });
+        assert_eq!(b[0].text.text, "shot");
+        assert_eq!(b[1].kind, BlockKind::Image { src: "x y.png".into(), width: Some(300) });
+        assert_eq!(b[1].text.text, "w");
+        // inline images stay part of the paragraph
+        assert_eq!(b[2].kind, BlockKind::Paragraph);
+        // a paragraph that merely looks like an image is escaped
+        let p = vec![Block::paragraph("![not](an image)x")];
+        assert_eq!(from_markdown(&to_markdown(&p))[0].kind, BlockKind::Paragraph);
+        assert_eq!(decode_url("a%2"), "a%2");
+        assert_eq!(decode_url("%E4%BD%A0"), "你");
     }
 }
