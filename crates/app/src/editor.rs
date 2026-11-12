@@ -6,15 +6,16 @@ use crate::edit::*;
 use crate::store::Store;
 use crate::text_view::TextLayout;
 use gpui::{
-    px, App, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, EventEmitter,
+    point, px, App, Bounds, ClipboardItem, Context, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, ScrollHandle, Subscription, UTF16Selection, Window,
+    Point, ScrollHandle, Subscription, Task, UTF16Selection, Window,
 };
 use nota_core::markdown::{from_markdown, to_markdown};
 use nota_core::{
-    normalize_indents, subtree_end, visibility, Block, BlockKind, MarkKind, Marks, PageKind,
-    RichText,
+    drop_indent_range, expand_to_subtrees, move_blocks, normalize_indents, subtree_end, visibility,
+    Block, BlockKind, MarkKind, Marks, PageKind, RichText,
 };
+use std::time::Duration;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -120,9 +121,35 @@ pub struct BlockMenu {
 
 #[derive(Clone)]
 pub struct DragBlock {
-    pub ix: usize,
+    /// Runtime id of the block whose handle was grabbed.
+    pub id: u64,
     pub label: String,
+    /// How many blocks move (the block selection, if the grabbed block is in it).
+    pub count: usize,
 }
+
+/// Where dragged blocks would land: before `gap` (an index into `blocks`,
+/// `blocks.len()` for the end) with the first block at `indent`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DropTarget {
+    pub gap: usize,
+    pub indent: u8,
+}
+
+/// Rubber-band selection started in empty space.
+pub struct Marquee {
+    /// Start point in content coordinates (window point minus scroll offset).
+    pub start: Point<Pixels>,
+    /// Current pointer position in window coordinates.
+    pub current: Point<Pixels>,
+    /// Becomes true once the pointer moved far enough to count as a drag.
+    pub active: bool,
+    /// Started below the last block: a plain click there adds a line.
+    pub from_tail: bool,
+}
+
+pub const INDENT_PX: f32 = 24.0;
+const GUTTER_PX: f32 = 50.0;
 
 pub struct Editor {
     pub(crate) store: Entity<Store>,
@@ -145,6 +172,15 @@ pub struct Editor {
     last_edit: Option<(Instant, EditKind, usize)>,
     pub(crate) scroll: ScrollHandle,
     pub(crate) scroll_pending: bool,
+    /// Window bounds of every rendered block row, by block id.
+    pub(crate) row_bounds: Rc<RefCell<HashMap<u64, Bounds<Pixels>>>>,
+    pub(crate) drop_target: Option<DropTarget>,
+    /// Blocks being dragged (dimmed while the drag lasts).
+    pub(crate) drag_range: Option<Range<usize>>,
+    pub(crate) marquee: Option<Marquee>,
+    last_mouse: Option<Point<Pixels>>,
+    autoscrolling: bool,
+    _autoscroll: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
 
@@ -201,6 +237,13 @@ impl Editor {
             last_edit: None,
             scroll,
             scroll_pending: false,
+            row_bounds: Rc::new(RefCell::new(HashMap::new())),
+            drop_target: None,
+            drag_range: None,
+            marquee: None,
+            last_mouse: None,
+            autoscrolling: false,
+            _autoscroll: None,
             _subs: subs,
         };
         editor.fix_selection();
@@ -760,34 +803,248 @@ impl Editor {
         self.after_edit(cx);
     }
 
-    /// Move the subtree at `from` so that it sits right after the subtree at `to`.
-    pub(crate) fn move_block_after(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        if from >= self.blocks.len() || to >= self.blocks.len() {
-            return;
+    // ----------------------------------------------------------------------
+    // dragging blocks
+    // ----------------------------------------------------------------------
+
+    /// The blocks that move when the handle of block `ix` is dragged: the
+    /// whole block selection if `ix` is part of it, else `ix` and its children.
+    pub(crate) fn moving_range(&self, ix: usize) -> Range<usize> {
+        match self.block_sel_range() {
+            Some(r) if r.contains(&ix) => expand_to_subtrees(&self.blocks, r),
+            _ => ix..subtree_end(&self.blocks, ix),
         }
-        let from_end = subtree_end(&self.blocks, from);
-        if to >= from && to < from_end {
-            return;
+    }
+
+    fn index_of(&self, id: u64) -> Option<usize> {
+        self.blocks.iter().position(|b| b.id == id)
+    }
+
+    /// Visible blocks that have been laid out, with their row bounds, top to bottom.
+    fn visible_rows(&self) -> Vec<(usize, Bounds<Pixels>)> {
+        let vis = visibility(&self.blocks);
+        let rows = self.row_bounds.borrow();
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| vis[*i])
+            .filter_map(|(i, b)| rows.get(&b.id).map(|r| (i, *r)))
+            .collect()
+    }
+
+    /// Left edge of a block's content (where its text or marker starts).
+    fn content_left(&self, ix: usize, row: &Bounds<Pixels>) -> Pixels {
+        row.left() + px(GUTTER_PX + self.blocks[ix].indent as f32 * INDENT_PX)
+    }
+
+    /// Work out where the dragged blocks would land for a pointer position.
+    fn drop_target_at(&self, pos: Point<Pixels>, moving: &Range<usize>) -> Option<DropTarget> {
+        let rows = self.visible_rows();
+        if rows.is_empty() {
+            return None;
         }
+        let gap = rows
+            .iter()
+            .find(|(_, b)| pos.y < b.center().y)
+            .map_or(self.blocks.len(), |(i, _)| *i);
+        if gap > moving.start && gap < moving.end {
+            return None;
+        }
+        let (min, max) = drop_indent_range(&self.blocks, moving.clone(), gap);
+        // The block shown just above the gap decides the default depth.
+        let above = rows.iter().rev().find(|(i, _)| *i < gap && !moving.contains(i));
+        let wanted = match above {
+            None => 0,
+            Some((p, row)) => {
+                let depth = self.blocks[*p].indent as i32;
+                let offset = (pos.x - self.content_left(*p, row)) / px(1.);
+                if offset > 48.0 {
+                    depth + 1
+                } else if offset < -30.0 {
+                    depth - (((-offset - 30.0) / INDENT_PX).floor() as i32 + 1)
+                } else {
+                    depth
+                }
+            }
+        };
+        let indent = wanted.clamp(min as i32, max as i32) as u8;
+        let same_place = gap == moving.start || gap == moving.end;
+        if same_place && indent == self.blocks[moving.start].indent {
+            return None;
+        }
+        Some(DropTarget { gap, indent })
+    }
+
+    pub(crate) fn drag_moved(&mut self, drag: &DragBlock, pos: Point<Pixels>, inside: bool, cx: &mut Context<Self>) {
+        self.last_mouse = Some(pos);
+        let Some(ix) = self.index_of(drag.id) else { return };
+        let moving = self.moving_range(ix);
+        let target = if inside { self.drop_target_at(pos, &moving) } else { None };
+        if self.drag_range.as_ref() != Some(&moving) || self.drop_target != target {
+            self.drag_range = Some(moving);
+            self.drop_target = target;
+            cx.notify();
+        }
+        self.ensure_autoscroll(cx);
+    }
+
+    pub(crate) fn drop_dragged(&mut self, drag: &DragBlock, cx: &mut Context<Self>) {
+        let target = self.drop_target.take();
+        self.drag_range = None;
+        let (Some(target), Some(ix)) = (target, self.index_of(drag.id)) else {
+            cx.notify();
+            return;
+        };
+        let moving = self.moving_range(ix);
+        let mut blocks = self.blocks.clone();
+        let Some(placed) = move_blocks(&mut blocks, moving, target.gap, target.indent) else {
+            cx.notify();
+            return;
+        };
         self.checkpoint(EditKind::Other);
-        let target_indent = self.blocks[to].indent;
-        let to_end = subtree_end(&self.blocks, to);
-        let base_indent = self.blocks[from].indent;
-        let mut moved: Vec<Block> = self.blocks.drain(from..from_end).collect();
-        for b in &mut moved {
-            b.indent = b.indent - base_indent + target_indent;
-        }
-        let insert_at = if to_end > from { to_end - moved.len() } else { to_end };
-        let n = moved.len();
-        for (i, b) in moved.into_iter().enumerate() {
-            self.blocks.insert(insert_at + i, b);
-        }
-        let _ = n;
-        if self.blocks[insert_at].kind.has_text() {
-            self.sel = Sel::caret(insert_at, 0);
-        }
-        self.block_sel = None;
+        self.blocks = blocks;
+        // Like Notion: the moved blocks stay selected.
+        self.block_sel = Some((placed.start, placed.end - 1));
+        self.sel = Sel::caret(placed.start, 0);
+        self.close_popups();
         self.after_edit(cx);
+    }
+
+    /// Forget drag state once the drag is over (dropped elsewhere or cancelled).
+    pub(crate) fn clear_stale_drag(&mut self, cx: &App) {
+        if !cx.has_active_drag() {
+            self.drop_target = None;
+            self.drag_range = None;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // rubber-band selection and auto-scroll
+    // ----------------------------------------------------------------------
+
+    /// Start a selection rectangle at `pos` (window coordinates).
+    pub fn begin_marquee(&mut self, pos: Point<Pixels>, from_tail: bool, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus);
+        self.close_popups();
+        self.selecting = false;
+        let offset = self.scroll.offset();
+        self.marquee = Some(Marquee {
+            start: point(pos.x - offset.x, pos.y - offset.y),
+            current: pos,
+            active: false,
+            from_tail,
+        });
+        self.last_mouse = Some(pos);
+        cx.notify();
+    }
+
+    /// The rectangle's start point in window coordinates (follows scrolling).
+    pub(crate) fn marquee_origin(&self) -> Option<Point<Pixels>> {
+        let m = self.marquee.as_ref()?;
+        let offset = self.scroll.offset();
+        Some(point(m.start.x + offset.x, m.start.y + offset.y))
+    }
+
+    fn update_marquee(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(origin) = self.marquee_origin() else { return };
+        let Some(m) = self.marquee.as_mut() else { return };
+        m.current = pos;
+        if !m.active {
+            if (pos - origin).magnitude() < 4.0 {
+                return;
+            }
+            m.active = true;
+            self.sel.range = self.sel.cursor()..self.sel.cursor();
+        }
+        let (top, bottom) = (origin.y.min(pos.y), origin.y.max(pos.y));
+        let hit: Vec<usize> = self
+            .visible_rows()
+            .into_iter()
+            .filter(|(_, b)| b.bottom() > top && b.top() < bottom)
+            .map(|(i, _)| i)
+            .collect();
+        self.block_sel = match (hit.first(), hit.last()) {
+            (Some(&first), Some(&last)) if pos.y >= origin.y => Some((first, last)),
+            (Some(&first), Some(&last)) => Some((last, first)),
+            _ => None,
+        };
+        cx.notify();
+    }
+
+    fn end_marquee(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(m) = self.marquee.take() {
+            if !m.active {
+                self.block_sel = None;
+                if m.from_tail {
+                    self.click_below(window, cx);
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    /// Scroll speed for a pointer near the top or bottom edge of the page.
+    fn edge_speed(&self, pos: Point<Pixels>) -> Option<Pixels> {
+        let vp = self.scroll.bounds();
+        if vp.size.height <= px(0.) {
+            return None;
+        }
+        let edge = px(56.);
+        let dy = if pos.y < vp.top() + edge {
+            vp.top() + edge - pos.y
+        } else if pos.y > vp.bottom() - edge {
+            -(pos.y - (vp.bottom() - edge))
+        } else {
+            return None;
+        };
+        let step = (dy / px(1.) * 0.35).clamp(-24.0, 24.0);
+        (step.abs() >= 0.5).then_some(px(step))
+    }
+
+    fn pointer_busy(&self, cx: &App) -> bool {
+        self.selecting || self.marquee.as_ref().is_some_and(|m| m.active) || cx.has_active_drag()
+    }
+
+    /// Keep scrolling while the pointer rests near an edge during a drag.
+    fn ensure_autoscroll(&mut self, cx: &mut Context<Self>) {
+        if self.autoscrolling || !self.pointer_busy(cx) {
+            return;
+        }
+        if self.last_mouse.and_then(|p| self.edge_speed(p)).is_none() {
+            return;
+        }
+        self.autoscrolling = true;
+        self._autoscroll = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_millis(16)).await;
+            let more = this.update(cx, |this, cx| this.autoscroll_step(cx)).unwrap_or(false);
+            if !more {
+                this.update(cx, |this, _| this.autoscrolling = false).ok();
+                break;
+            }
+        }));
+    }
+
+    fn autoscroll_step(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.pointer_busy(cx) {
+            return false;
+        }
+        let Some(pos) = self.last_mouse else { return false };
+        let Some(step) = self.edge_speed(pos) else { return false };
+        let mut offset = self.scroll.offset();
+        let max = self.scroll.max_offset().height;
+        let y = (offset.y + step).min(px(0.)).max(-max);
+        if y == offset.y {
+            return false;
+        }
+        offset.y = y;
+        self.scroll.set_offset(offset);
+        if self.marquee.is_some() {
+            self.update_marquee(pos, cx);
+        } else if self.selecting {
+            self.extend_selection(pos, cx);
+        }
+        cx.notify();
+        true
     }
 
     fn move_block(&mut self, up: bool, cx: &mut Context<Self>) {
@@ -1704,13 +1961,24 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus);
         cx.stop_propagation();
-        self.close_popups();
         self.goal_x = None;
         if ix >= self.blocks.len() {
             return;
         }
+        // A press in the margin beside a block starts a selection rectangle.
+        let row = self.row_bounds.borrow().get(&self.blocks[ix].id).copied();
+        if let Some(row) = row {
+            let x = event.position.x;
+            if !event.modifiers.shift
+                && (x < self.content_left(ix, &row) - px(2.) || x > row.right() - px(GUTTER_PX) + px(2.))
+            {
+                self.begin_marquee(event.position, false, window, cx);
+                return;
+            }
+        }
+        window.focus(&self.focus);
+        self.close_popups();
         if !self.blocks[ix].kind.has_text() {
             self.block_sel = Some((ix, ix));
             cx.notify();
@@ -1759,56 +2027,42 @@ impl Editor {
         cx.notify();
     }
 
+    /// Pointer moved anywhere in the window while a text selection or a
+    /// selection rectangle is in progress.
     pub(crate) fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selecting {
+        if !self.selecting && self.marquee.is_none() {
             return;
         }
         if event.pressed_button != Some(MouseButton::Left) {
             self.selecting = false;
+            self.marquee = None;
+            cx.notify();
             return;
         }
+        self.last_mouse = Some(event.position);
+        if self.marquee.is_some() {
+            self.update_marquee(event.position, cx);
+        } else {
+            self.extend_selection(event.position, cx);
+        }
+        self.ensure_autoscroll(cx);
+    }
+
+    /// The visible block whose row is at height `y` (or the nearest one).
+    fn row_at_y(&self, y: Pixels) -> Option<usize> {
+        let rows = self.visible_rows();
+        rows.iter().find(|(_, b)| y <= b.bottom()).or(rows.last()).map(|(i, _)| *i)
+    }
+
+    fn extend_selection(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         let Some((anchor_block, anchor_offset)) = self.drag_anchor else {
             return;
         };
-        // which block is under the pointer?
-        let vis = visibility(&self.blocks);
-        let layouts = self.layouts.borrow();
-        let mut target = None;
-        let mut first: Option<(usize, Pixels)> = None;
-        let mut last: Option<(usize, Pixels)> = None;
-        for (i, b) in self.blocks.iter().enumerate() {
-            if !vis[i] {
-                continue;
-            }
-            let Some(l) = layouts.get(&b.id) else {
-                continue;
-            };
-            let bounds = l.bounds();
-            if first.is_none() {
-                first = Some((i, bounds.top()));
-            }
-            last = Some((i, bounds.bottom()));
-            if event.position.y >= bounds.top() - px(3.) && event.position.y <= bounds.bottom() + px(3.) {
-                target = Some(i);
-                break;
-            }
-        }
-        if target.is_none() {
-            if let (Some((fi, top)), Some((li, bottom))) = (first, last) {
-                if event.position.y < top {
-                    target = Some(fi);
-                } else if event.position.y > bottom {
-                    target = Some(li);
-                }
-            }
-        }
-        let offset = layouts
-            .get(&self.blocks[anchor_block.min(self.blocks.len() - 1)].id)
-            .map(|l| l.index_for_point(event.position));
-        drop(layouts);
-        let Some(target) = target else {
+        let anchor_block = anchor_block.min(self.blocks.len() - 1);
+        let Some(target) = self.row_at_y(pos.y) else {
             return;
         };
+        let offset = self.layout_of(anchor_block).map(|l| l.index_for_point(pos));
         if target == anchor_block {
             self.block_sel = None;
             if let Some(offset) = offset {
@@ -1823,11 +2077,19 @@ impl Editor {
         cx.notify();
     }
 
-    pub(crate) fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_mouse_up(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.selecting {
             self.selecting = false;
             cx.notify();
         }
+        if self.marquee.is_some() {
+            self.end_marquee(window, cx);
+        }
+    }
+
+    /// Whether the pointer is currently being tracked outside normal hover.
+    pub(crate) fn tracking_pointer(&self) -> bool {
+        self.selecting || self.marquee.is_some()
     }
 
     /// Click in the empty space under the last block.

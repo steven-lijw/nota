@@ -211,6 +211,15 @@ pub struct AppState {
     pub ai_allow_edits: bool,
 }
 
+/// Where to put a page among its siblings.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Anchor {
+    Start,
+    End,
+    Before(String),
+    After(String),
+}
+
 #[derive(Clone, Debug)]
 pub struct SearchHit {
     pub id: String,
@@ -429,6 +438,59 @@ impl Vault {
         let id = page.id.clone();
         self.pages.insert(id.clone(), page);
         id
+    }
+
+    /// Put page `id` under `parent` at the position given by `anchor`
+    /// (relative to its new siblings). Returns every page whose `parent` or
+    /// `order` changed. Orders are spread out again only when there is no
+    /// room left between the neighbours.
+    pub fn place_page(&mut self, id: &str, parent: Option<String>, anchor: Anchor) -> Vec<String> {
+        if !self.pages.contains_key(id) {
+            return vec![];
+        }
+        let siblings: Vec<(String, f64)> = self
+            .children(parent.as_deref())
+            .into_iter()
+            .filter(|p| p.id != id)
+            .map(|p| (p.id.clone(), p.order))
+            .collect();
+        let pos = match &anchor {
+            Anchor::Start => 0,
+            Anchor::End => siblings.len(),
+            Anchor::Before(b) => siblings.iter().position(|s| &s.0 == b).unwrap_or(siblings.len()),
+            Anchor::After(a) => siblings.iter().position(|s| &s.0 == a).map_or(siblings.len(), |i| i + 1),
+        };
+        let prev = pos.checked_sub(1).map(|i| siblings[i].1);
+        let next = siblings.get(pos).map(|s| s.1);
+        let mut touched = vec![id.to_string()];
+        let order = match (prev, next) {
+            (None, None) => Some(1.0),
+            (Some(p), None) => Some(p + 1.0),
+            (None, Some(n)) => Some(n - 1.0),
+            (Some(p), Some(n)) if n - p > 1e-6 => Some((p + n) / 2.0),
+            _ => None,
+        };
+        let order = match order {
+            Some(o) => o,
+            None => {
+                // no gap: renumber the siblings 1, 2, 3… with room for this page
+                for (i, (sid, _)) in siblings.iter().enumerate() {
+                    let o = (i + if i >= pos { 2 } else { 1 }) as f64;
+                    if let Some(p) = self.pages.get_mut(sid) {
+                        if p.order != o {
+                            p.order = o;
+                            touched.push(sid.clone());
+                        }
+                    }
+                }
+                (pos + 1) as f64
+            }
+        };
+        if let Some(p) = self.pages.get_mut(id) {
+            p.parent = parent;
+            p.order = order;
+        }
+        touched
     }
 
     pub fn touch(&mut self, id: &str) {
@@ -660,6 +722,31 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nota-test-{}-{}", name, new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn place_page_orders() {
+        let mut vault = Vault { root: temp_dir("place"), pages: HashMap::new() };
+        let a = vault.create_page(PageKind::Page, None);
+        let b = vault.create_page(PageKind::Page, None);
+        let c = vault.create_page(PageKind::Page, None);
+        let ids = |v: &Vault| v.children(None).iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+        vault.place_page(&c, None, Anchor::Before(a.clone()));
+        assert_eq!(ids(&vault), vec![c.clone(), a.clone(), b.clone()]);
+        let touched = vault.place_page(&c, None, Anchor::After(a.clone()));
+        assert_eq!(touched, vec![c.clone()]);
+        assert_eq!(ids(&vault), vec![a.clone(), c.clone(), b.clone()]);
+        // equal orders (e.g. imported files) force a renumber
+        for p in vault.pages.values_mut() {
+            p.order = 0.0;
+        }
+        let before = ids(&vault);
+        let moved = before[2].clone();
+        vault.place_page(&moved, None, Anchor::Before(before[0].clone()));
+        assert_eq!(ids(&vault), vec![moved, before[0].clone(), before[1].clone()]);
+        // into another parent
+        vault.place_page(&b, Some(a.clone()), Anchor::End);
+        assert_eq!(vault.children(Some(&a)).len(), 1);
     }
 
     #[test]

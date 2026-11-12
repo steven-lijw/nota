@@ -70,7 +70,15 @@ impl PageView {
                 }
                 _ => {}
             }),
-            cx.subscribe(&store, |this: &mut Self, _, _: &StoreEvent, cx| {
+            cx.subscribe(&store, |this: &mut Self, _, ev: &StoreEvent, cx| {
+                if let StoreEvent::BlocksChanged(id) = ev {
+                    if *id == this.page_id {
+                        if let Some(editor) = &this.editor {
+                            editor.update(cx, |e, cx| e.reload_blocks(cx));
+                        }
+                    }
+                    return;
+                }
                 let text = this.store.read(cx).page(&this.page_id).map(|p| p.title.clone()).unwrap_or_default();
                 this.title.update(cx, |t, cx| {
                     if t.text() != text {
@@ -381,7 +389,25 @@ impl Render for PageView {
             if let Some(editor) = &self.editor {
                 inner = inner.child(div().flex().flex_col().w_full().pt(px(4.)).child(editor.clone()));
             }
-            column = column.child(div().flex().justify_center().w_full().child(inner));
+            // The empty margins beside the text start a block selection rectangle.
+            let margin = |id: &'static str| {
+                div().id(id).flex_1().min_w_0().on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
+                        if let Some(editor) = &this.editor {
+                            editor.update(cx, |e, cx| e.begin_marquee(ev.position, false, window, cx));
+                        }
+                    }),
+                )
+            };
+            column = column.child(
+                div()
+                    .flex()
+                    .w_full()
+                    .child(margin("page-margin-left"))
+                    .child(inner.min_w_0())
+                    .child(margin("page-margin-right")),
+            );
         }
 
         let mut root = div()

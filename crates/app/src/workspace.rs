@@ -10,12 +10,12 @@ use crate::text_input::{InputEvent, TextInput};
 use crate::theme::{theme, Theme, AI_PANEL_W, SIDEBAR_W, TOPBAR_H};
 use crate::ui::*;
 use gpui::{
-    deferred, div, prelude::*, px, AnyElement, ClipboardItem, Context, Corner, Entity, FontWeight, MouseButton,
-    MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString, Subscription, Window,
+    deferred, div, prelude::*, px, AnyElement, ClipboardItem, Context, Corner, DragMoveEvent, Entity, FontWeight,
+    MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString, Subscription, Window,
 };
 use nota_core::markdown::{from_markdown, to_markdown};
 use nota_core::query::relative_time;
-use nota_core::{Block, BlockKind, Page, PageKind, Vault};
+use nota_core::{Anchor, Block, BlockKind, Page, PageKind, Vault};
 
 const MAC: bool = cfg!(target_os = "macos");
 
@@ -25,6 +25,14 @@ enum Menu {
     Trash,
     Settings,
     More,
+}
+
+/// Where a page dragged in the sidebar would go, relative to the row under the pointer.
+#[derive(Clone, Copy, PartialEq)]
+enum Zone {
+    Before,
+    Inside,
+    After,
 }
 
 #[derive(Clone)]
@@ -68,6 +76,7 @@ pub struct Workspace {
     ai: Entity<AiPanel>,
     search: Option<Search>,
     menu: Option<(Menu, Point<Pixels>)>,
+    side_drop: Option<(String, Zone)>,
     _page_sub: Option<Subscription>,
     _subs: Vec<Subscription>,
 }
@@ -77,7 +86,10 @@ impl Workspace {
         let ai = cx.new(|cx| AiPanel::new(store.clone(), window, cx));
         let subs = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
-            cx.subscribe_in(&store, window, |this: &mut Self, _, _: &StoreEvent, window, cx| {
+            cx.subscribe_in(&store, window, |this: &mut Self, _, ev: &StoreEvent, window, cx| {
+                if !matches!(ev, StoreEvent::Reloaded) {
+                    return;
+                }
                 let gone = this.current.as_ref().is_none_or(|id| this.store.read(cx).page(id).is_none());
                 if gone {
                     this.back.clear();
@@ -106,6 +118,7 @@ impl Workspace {
             ai,
             search: None,
             menu: None,
+            side_drop: None,
             _page_sub: None,
             _subs: subs,
         };
@@ -209,6 +222,7 @@ impl Workspace {
                         let at = if tail_empty { p.blocks.len() - 1 } else { p.blocks.len() };
                         p.blocks.insert(at, link);
                     });
+                    cx.emit(StoreEvent::BlocksChanged(parent.clone()));
                 }
                 s.set_expanded(&parent, true, cx);
             }
@@ -381,7 +395,9 @@ impl Workspace {
         cx.notify();
     }
 
-    fn move_page(&mut self, id: &str, new_parent: Option<String>, cx: &mut Context<Self>) {
+    /// Move a page in the tree: under `new_parent`, at `anchor` among its siblings.
+    /// The sub-page link moves from the old parent's body to the new one's.
+    fn move_page(&mut self, id: &str, new_parent: Option<String>, anchor: Anchor, cx: &mut Context<Self>) {
         self.store.update(cx, |s, cx| {
             if let Some(parent) = &new_parent {
                 let bad = parent == id
@@ -391,20 +407,53 @@ impl Workspace {
                     return;
                 }
             }
-            if s.page(id).is_some_and(|p| p.parent == new_parent) {
+            if matches!(&anchor, Anchor::Before(a) | Anchor::After(a) if a == id) {
                 return;
             }
-            let order = s.vault.children(new_parent.as_deref()).last().map_or(1.0, |p| p.order + 1.0);
-            let np = new_parent.clone();
-            s.update_page(id, cx, |p| {
-                p.parent = np;
-                p.props.clear();
-                p.order = order;
-            });
+            let old_parent = s.page(id).and_then(|p| p.parent.clone());
+            let reparent = old_parent != new_parent;
+            if reparent {
+                s.update_page(id, cx, |p| p.props.clear());
+                if let Some(old) = old_parent.filter(|o| s.page(o).is_some_and(|p| !p.is_database())) {
+                    let target = id.to_string();
+                    s.update_page(&old, cx, |p| {
+                        p.blocks.retain(|b| !matches!(&b.kind, BlockKind::PageLink { page } if *page == target));
+                        if p.blocks.is_empty() {
+                            p.blocks.push(Block::paragraph(""));
+                        }
+                    });
+                    cx.emit(StoreEvent::BlocksChanged(old));
+                }
+                if let Some(new) = &new_parent {
+                    let link = Block::new(BlockKind::PageLink { page: id.to_string() }, "");
+                    s.update_page(new, cx, |p| {
+                        let tail_empty =
+                            p.blocks.last().is_some_and(|b| b.kind == BlockKind::Paragraph && b.text.is_empty());
+                        let at = if tail_empty { p.blocks.len() - 1 } else { p.blocks.len() };
+                        p.blocks.insert(at, link);
+                    });
+                    cx.emit(StoreEvent::BlocksChanged(new.clone()));
+                }
+            }
+            s.place_page(id, new_parent.clone(), anchor, cx);
             if let Some(parent) = &new_parent {
                 s.set_expanded(parent, true, cx);
             }
         });
+    }
+
+    fn drop_on_row(&mut self, dragged: &str, cx: &mut Context<Self>) {
+        let Some((target, zone)) = self.side_drop.take() else {
+            cx.notify();
+            return;
+        };
+        let parent = self.store.read(cx).page(&target).and_then(|p| p.parent.clone());
+        match zone {
+            Zone::Inside => self.move_page(dragged, Some(target), Anchor::End, cx),
+            Zone::Before => self.move_page(dragged, parent, Anchor::Before(target), cx),
+            Zone::After => self.move_page(dragged, parent, Anchor::After(target), cx),
+        }
+        cx.notify();
     }
 
     // --- sidebar -------------------------------------------------------------
@@ -480,11 +529,48 @@ impl Workspace {
         if selected {
             row = row.bg(t.active);
         }
-        if can_nest {
-            let accent_bg = t.accent_bg;
+        if section == "tree" {
+            let target = i3.clone();
             row = row
-                .drag_over::<DragPage>(move |s, _, _, _| s.bg(accent_bg))
-                .on_drop(cx.listener(move |this, d: &DragPage, _, cx| this.move_page(&d.id, Some(i3.clone()), cx)));
+                .relative()
+                .on_drag_move(cx.listener(move |this, ev: &DragMoveEvent<DragPage>, _, cx| {
+                    let pos = ev.event.position;
+                    let mine = this.side_drop.as_ref().is_some_and(|(t, _)| *t == target);
+                    if !ev.bounds.contains(&pos) {
+                        if mine {
+                            this.side_drop = None;
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    if ev.drag(cx).id == target {
+                        this.side_drop = None;
+                        cx.notify();
+                        return;
+                    }
+                    let frac = (pos.y - ev.bounds.top()) / ev.bounds.size.height;
+                    let zone = if can_nest && (0.28..=0.72).contains(&frac) {
+                        Zone::Inside
+                    } else if frac < 0.5 {
+                        Zone::Before
+                    } else {
+                        Zone::After
+                    };
+                    let next = Some((target.clone(), zone));
+                    if this.side_drop != next {
+                        this.side_drop = next;
+                        cx.notify();
+                    }
+                }))
+                .on_drop(cx.listener(move |this, d: &DragPage, _, cx| this.drop_on_row(&d.id, cx)));
+            if let Some((_, zone)) = self.side_drop.as_ref().filter(|(t, _)| *t == page.id) {
+                let line = || div().absolute().left(px(4. + depth as f32 * 14.)).right(px(4.)).h(px(2.)).bg(t.accent);
+                row = match zone {
+                    Zone::Inside => row.bg(t.accent_bg),
+                    Zone::Before => row.child(line().top(px(-1.))),
+                    Zone::After => row.child(line().bottom(px(-1.))),
+                };
+            }
         }
         row = row.child(if section == "tree" && can_nest {
             small(eid("nav-exp", &key), if expanded { "chevron-down" } else { "chevron-right" })
@@ -667,7 +753,7 @@ impl Workspace {
                 .group("side-private")
                 .rounded(px(6.))
                 .drag_over::<DragPage>(move |s, _, _, _| s.bg(accent_bg))
-                .on_drop(cx.listener(|this, d: &DragPage, _, cx| this.move_page(&d.id, None, cx)))
+                .on_drop(cx.listener(|this, d: &DragPage, _, cx| this.move_page(&d.id, None, Anchor::Start, cx)))
                 .child(
                     div()
                         .id("side-private-add")
@@ -1100,6 +1186,9 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme(cx);
+        if !cx.has_active_drag() && self.side_drop.is_some() {
+            self.side_drop = None;
+        }
         let store = self.store.clone();
         let cx: &Context<Self> = cx;
         let s = store.read(cx);

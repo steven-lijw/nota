@@ -3,13 +3,14 @@
 
 use crate::actions::*;
 use crate::blocks_view::{block_text, bullet_glyph, marker_box, top_margin};
-use crate::editor::{BlockMenu, DragBlock, Editor, EditorEvent, Sel};
+use crate::editor::{BlockMenu, DragBlock, Editor, EditorEvent, Sel, INDENT_PX};
 use crate::text_view::{TextLayout, TextView};
 use crate::theme::{theme, ui_font, Theme};
 use crate::ui::*;
 use gpui::{
-    anchored, deferred, div, font, point, prelude::*, px, AnyElement, Context, Corner,
-    ElementInputHandler, FontWeight, MouseButton, SharedString, TextRun, Window,
+    anchored, canvas, deferred, div, font, point, prelude::*, px, AnyElement, Context, Corner,
+    DispatchPhase, DragMoveEvent, ElementInputHandler, FontWeight, Hsla, MouseButton, MouseMoveEvent,
+    MouseUpEvent, SharedString, TextRun, Window,
 };
 use nota_core::{list_number, visibility, Block, BlockKind, MarkKind};
 use std::collections::HashSet;
@@ -17,7 +18,7 @@ use std::collections::HashSet;
 /// Rows extend this far into the page margins so the hover handles stay
 /// inside the row's hit area.
 pub const GUTTER: f32 = 50.0;
-const INDENT: f32 = 24.0;
+const INDENT: f32 = INDENT_PX;
 const BASE: f32 = 16.0;
 
 pub struct DragPreview {
@@ -89,7 +90,7 @@ impl Editor {
         cx.notify();
     }
 
-    fn render_block(&self, ix: usize, focused: bool, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_block(&self, ix: usize, last_visible: bool, focused: bool, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let block: &Block = &self.blocks[ix];
         let id = block.id;
         let bt = block_text(block, t, BASE);
@@ -352,6 +353,10 @@ impl Editor {
         // --- hover handles -----------------------------------------------------
         let hover = t.hover;
         let label: String = block.text.text.chars().take(60).collect();
+        let drag_count = {
+            let r = self.moving_range(ix);
+            if r.len() > 1 && self.block_sel_range().is_some_and(|s| s.contains(&ix)) { r.len() } else { 1 }
+        };
         let handle_top = pad_y + handle_offset + ((lh / px(1.)) - 24.0) / 2.0;
         let handles = div()
             .absolute()
@@ -398,7 +403,8 @@ impl Editor {
                     }))
                     .on_drag(
                         DragBlock {
-                            ix,
+                            id,
+                            count: drag_count,
                             label: if label.is_empty() {
                                 block.kind.label().to_string()
                             } else {
@@ -406,7 +412,11 @@ impl Editor {
                             },
                         },
                         |drag: &DragBlock, _, _, cx| {
-                            let label: SharedString = drag.label.clone().into();
+                            let label: SharedString = if drag.count > 1 {
+                                format!("{} blocks", drag.count).into()
+                            } else {
+                                drag.label.clone().into()
+                            };
                             cx.new(|_| DragPreview { label })
                         },
                     )
@@ -414,6 +424,8 @@ impl Editor {
             );
 
         let accent = t.accent;
+        let mt = top_margin(&block.kind, ix == 0, BASE);
+        let rows = self.row_bounds.clone();
         let mut row = div()
             .id(("block", id as usize))
             .group(group.clone())
@@ -423,14 +435,23 @@ impl Editor {
             .w_full()
             .pl(px(GUTTER + indent_px))
             .pr(px(GUTTER))
-            .mt(px(top_margin(&block.kind, ix == 0, BASE)))
+            .mt(px(mt))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, ev, window, cx| this.mouse_down_on_block(ix, ev, window, cx)),
             )
-            .on_drop(cx.listener(move |this, drag: &DragBlock, _, cx| {
-                this.move_block_after(drag.ix, ix, cx);
-            }));
+            .child(
+                canvas(move |bounds, _, _| {
+                    rows.borrow_mut().insert(id, bounds);
+                }, |_, _, _, _| {})
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            );
+        if self.drag_range.as_ref().is_some_and(|r| r.contains(&ix)) {
+            row = row.opacity(0.4);
+        }
         if in_block_sel {
             row = row.child(
                 div()
@@ -443,19 +464,47 @@ impl Editor {
                     .bg(t.block_selection),
             );
         }
-        row.child(handles)
-            .child(content)
-            .child(
+        row = row.child(handles).child(content);
+        if let Some(target) = self.drop_target {
+            let line = |indent: u8| {
                 div()
                     .absolute()
-                    .left(px(GUTTER + indent_px))
+                    .left(px(GUTTER + indent as f32 * INDENT))
                     .right(px(GUTTER))
-                    .bottom(px(-2.))
                     .h(px(3.))
                     .rounded(px(1.5))
-                    .group_drag_over::<DragBlock>(group, move |s| s.bg(accent)),
+                    .bg(accent)
+            };
+            if target.gap == ix {
+                row = row.child(line(target.indent).top(px(-(mt / 2.0) - 2.)));
+            } else if target.gap >= self.blocks.len() && last_visible {
+                row = row.child(line(target.indent).bottom(px(-3.)));
+            }
+        }
+        row.into_any_element()
+    }
+
+    fn render_marquee(&self, t: &Theme) -> Option<AnyElement> {
+        let m = self.marquee.as_ref().filter(|m| m.active)?;
+        let origin = self.marquee_origin()?;
+        let (l, r) = (origin.x.min(m.current.x), origin.x.max(m.current.x));
+        let (top, bottom) = (origin.y.min(m.current.y), origin.y.max(m.current.y));
+        let tint = |a: f32| Hsla { a, ..t.accent };
+        Some(
+            deferred(
+                anchored().position(point(l, top)).snap_to_window().child(
+                    div()
+                        .w(r - l)
+                        .h(bottom - top)
+                        .rounded(px(2.))
+                        .bg(tint(0.10))
+                        .border_1()
+                        .border_color(tint(0.40)),
+                ),
             )
-            .into_any_element()
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     fn render_slash_menu(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -665,7 +714,11 @@ impl Render for Editor {
         {
             let ids: HashSet<u64> = self.blocks.iter().map(|b| b.id).collect();
             self.layouts.borrow_mut().retain(|id, _| ids.contains(id));
+            // hidden rows (inside collapsed toggles) must not keep stale bounds
+            let shown: HashSet<u64> = self.blocks.iter().zip(&vis).filter(|(_, v)| **v).map(|(b, _)| b.id).collect();
+            self.row_bounds.borrow_mut().retain(|id, _| shown.contains(id));
         }
+        self.clear_stale_drag(cx);
 
         let mut col = div()
             .id("editor")
@@ -733,13 +786,18 @@ impl Render for Editor {
             .on_action(cx.listener(|this, _: &TurnCode, _, cx| {
                 this.turn_into(BlockKind::Code { lang: String::new() }, cx)
             }))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up));
+            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<DragBlock>, _, cx| {
+                let drag = ev.drag(cx).clone();
+                let pos = ev.event.position;
+                let inside = ev.bounds.contains(&pos) && this.scroll.bounds().contains(&pos);
+                this.drag_moved(&drag, pos, inside, cx);
+            }))
+            .on_drop(cx.listener(|this, drag: &DragBlock, _, cx| this.drop_dragged(drag, cx)));
 
+        let last_vis = (0..self.blocks.len()).rev().find(|&i| vis[i]);
         for ix in 0..self.blocks.len() {
             if vis[ix] {
-                col = col.child(self.render_block(ix, focused, &t, cx));
+                col = col.child(self.render_block(ix, Some(ix) == last_vis, focused, &t, cx));
             }
         }
 
@@ -752,12 +810,37 @@ impl Render for Editor {
                 .cursor_text()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
+                    cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
                         cx.stop_propagation();
-                        this.click_below(window, cx);
+                        this.begin_marquee(ev.position, true, window, cx);
                     }),
                 ),
         );
+
+        // While selecting, follow the pointer anywhere in the window.
+        if self.tracking_pointer() {
+            let entity = cx.entity();
+            col = col.child(
+                canvas(|_, _, _| {}, move |_, _, window, _| {
+                    let e = entity.clone();
+                    window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture {
+                            e.update(cx, |this, cx| this.on_mouse_move(ev, window, cx));
+                        }
+                    });
+                    let e = entity.clone();
+                    window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture && ev.button == MouseButton::Left {
+                            e.update(cx, |this, cx| this.on_mouse_up(ev, window, cx));
+                        }
+                    });
+                })
+                .absolute(),
+            );
+        }
+        if let Some(rect) = self.render_marquee(&t) {
+            col = col.child(rect);
+        }
 
         if let Some(menu) = self.render_slash_menu(&t, cx) {
             col = col.child(menu);
