@@ -1,40 +1,64 @@
-name: macOS DMG
+name: macOS build
 
+# Every push builds Nota.app. Pushes to main also publish a GitHub Release
+# (version 0.1.<run number>) that installed copies of Nota update themselves from.
 on:
   push:
-    branches: [main]
-    tags: ["v*"]
+    branches: ["**"]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  dmg:
+  build:
     runs-on: macos-latest   # Apple Silicon
+    env:
+      NOTA_VERSION: 0.1.${{ github.run_number }}
+      NOTA_BUILD: ${{ github.run_number }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Test nota-core
+        run: cargo test -p nota-core
       - name: Build Nota.app
         run: ./scripts/bundle-macos.sh
-      - name: Make DMG
+      - name: Package
         run: |
           mkdir -p dist/dmg
           cp -R dist/Nota.app dist/dmg/
           ln -s /Applications dist/dmg/Applications
           hdiutil create -volname Nota -srcfolder dist/dmg -ov -format UDZO dist/Nota-macos-arm64.dmg
+          # The in-app updater downloads this zip and checks it against the .sha256 file.
+          ditto -c -k --sequesterRsrc --keepParent dist/Nota.app dist/Nota-macos-arm64.zip
+          (cd dist && shasum -a 256 Nota-macos-arm64.zip | cut -d' ' -f1 > Nota-macos-arm64.zip.sha256)
       - uses: actions/upload-artifact@v4
         with:
-          name: Nota-macos-arm64
-          path: dist/Nota-macos-arm64.dmg
+          name: Nota-${{ env.NOTA_VERSION }}-macos-arm64
+          path: |
+            dist/Nota-macos-arm64.dmg
+            dist/Nota-macos-arm64.zip
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Nota-macos-arm64.dmg
+          tag_name: v${{ env.NOTA_VERSION }}
+          name: Nota ${{ env.NOTA_VERSION }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          files: |
+            dist/Nota-macos-arm64.dmg
+            dist/Nota-macos-arm64.zip
+            dist/Nota-macos-arm64.zip.sha256
           body: |
-            Nota for macOS (Apple Silicon).
+            Nota ${{ env.NOTA_VERSION }} for macOS (Apple Silicon), built from ${{ github.sha }}.
 
-            The app is not notarized. After dragging it into Applications, open it once with right-click → Open,
-            or run: `xattr -dr com.apple.quarantine /Applications/Nota.app`
+            Already installed? Nota updates itself — look for “Restart to update” at the bottom of the sidebar.
+
+            First install: open the DMG and drag Nota into Applications. The app is not notarized, so open it
+            once with right-click → Open, or run `xattr -dr com.apple.quarantine /Applications/Nota.app`.

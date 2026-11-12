@@ -56,6 +56,7 @@ actions!(
         TurnToggle,
         TurnCode,
         Quit,
+        CheckForUpdates,
         NewPage,
         ToggleSidebar,
         ToggleAi,

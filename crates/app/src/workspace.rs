@@ -9,6 +9,7 @@ use crate::store::{Store, StoreEvent};
 use crate::text_input::{InputEvent, TextInput};
 use crate::theme::{theme, Theme, AI_PANEL_W, SIDEBAR_W, TOPBAR_H};
 use crate::ui::*;
+use crate::update::{current_version, UpdateStatus, Updater};
 use gpui::{
     deferred, div, prelude::*, px, AnyElement, ClipboardItem, Context, Corner, DragMoveEvent, Entity, FontWeight,
     MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString, Subscription, Window,
@@ -79,6 +80,7 @@ pub struct Workspace {
     side_drop: Option<(String, Zone)>,
     /// Recently shown pages, kept alive so going back restores scroll and undo.
     recent: Vec<(String, Entity<PageView>)>,
+    updater: Entity<Updater>,
     _page_sub: Option<Subscription>,
     /// Follows the open editor's selection for the AI panel.
     _editor_obs: Option<Subscription>,
@@ -86,10 +88,11 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Entity<Store>, updater: Entity<Updater>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let ai = cx.new(|cx| AiPanel::new(store.clone(), window, cx));
         let subs = vec![
             cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.observe(&updater, |_, _, cx| cx.notify()),
             cx.subscribe_in(&store, window, |this: &mut Self, _, ev: &StoreEvent, window, cx| {
                 if !matches!(ev, StoreEvent::Reloaded) {
                     return;
@@ -136,6 +139,7 @@ impl Workspace {
             menu: None,
             side_drop: None,
             recent: Vec::new(),
+            updater,
             _page_sub: None,
             _editor_obs: None,
             _subs: subs,
@@ -836,7 +840,59 @@ impl Workspace {
                 |this, ev: &gpui::ClickEvent, _, cx| this.open_menu(Menu::Trash, ev.position(), cx),
             )));
         col = col.child(scroll);
+        if let Some(bar) = self.render_update_bar(t, cx) {
+            col = col.child(bar);
+        }
         col.into_any_element()
+    }
+
+    /// "Restart to update" at the bottom of the sidebar once an update is downloaded.
+    fn render_update_bar(&self, t: &Theme, cx: &Context<Self>) -> Option<AnyElement> {
+        let UpdateStatus::Ready { version, .. } = &self.updater.read(cx).status else {
+            return None;
+        };
+        let hover = t.accent_hover;
+        Some(
+            div()
+                .id("update-ready")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(8.))
+                .m(px(8.))
+                .px(px(10.))
+                .py(px(8.))
+                .rounded(px(8.))
+                .bg(t.accent)
+                .text_color(gpui::white())
+                .text_size(px(13.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .on_click(cx.listener(|this, _, _, cx| this.install_update(cx)))
+                .child(icon("refresh", 15., gpui::white()))
+                .child(div().flex_1().child("Restart to update"))
+                .child(div().text_size(px(12.)).opacity(0.85).child(SharedString::from(format!("v{version}"))))
+                .into_any_element(),
+        )
+    }
+
+    fn install_update(&mut self, cx: &mut Context<Self>) {
+        self.store.update(cx, |s, _| {
+            s.flush();
+            s.save_state();
+        });
+        let result = self.updater.update(cx, |u, cx| u.install(cx));
+        if let Err(msg) = result {
+            self.store.update(cx, |s, cx| {
+                s.last_error = Some(msg);
+                cx.notify();
+            });
+        }
+    }
+
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        self.updater.update(cx, |u, cx| u.check(true, cx));
     }
 
     // --- top bar ---------------------------------------------------------------
@@ -1057,7 +1113,32 @@ impl Workspace {
                                 this.menu = None;
                                 this.toggle_theme(cx)
                             })),
+                    )
+                    .child(menu_separator(t))
+                    .child(menu_label(SharedString::from(format!("Nota {}", current_version())), t));
+                let u = self.updater.read(cx);
+                let note = match &u.status {
+                    UpdateStatus::Checking => Some("Checking for updates…".to_string()),
+                    UpdateStatus::Downloading(v) => Some(format!("Downloading {v}…")),
+                    UpdateStatus::UpToDate if u.manual => Some("You're up to date.".to_string()),
+                    UpdateStatus::Failed(e) if u.manual => Some(e.clone()),
+                    _ => None,
+                };
+                surface = match &u.status {
+                    UpdateStatus::Ready { version, .. } => surface.child(
+                        menu_item("st-install", Some("refresh"), format!("Restart to update to {version}"), t)
+                            .on_click(cx.listener(|this, _, _, cx| this.install_update(cx))),
+                    ),
+                    _ => surface.child(
+                        menu_item("st-update", Some("refresh"), "Check for updates", t)
+                            .on_click(cx.listener(|this, _, _, cx| this.check_for_updates(cx))),
+                    ),
+                };
+                if let Some(note) = note {
+                    surface = surface.child(
+                        div().px(px(12.)).pb(px(6.)).text_size(px(12.)).text_color(t.text_faint).child(SharedString::from(note)),
                     );
+                }
             }
             Menu::Trash => {
                 surface = surface.w(px(340.)).child(menu_label("Trash", t));
@@ -1276,6 +1357,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ToggleAi, window, cx| this.toggle_ai(window, cx)))
             .on_action(cx.listener(|this, _: &QuickFind, window, cx| this.open_search(window, cx)))
             .on_action(cx.listener(|this, _: &ToggleTheme, _, cx| this.toggle_theme(cx)))
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| {
+                this.check_for_updates(cx);
+                this.menu = Some((Menu::Settings, gpui::point(px(250.), px(420.))));
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &GoBack, window, cx| this.go_back(window, cx)))
             .on_action(cx.listener(|this, _: &GoForward, window, cx| this.go_forward(window, cx)));
         if !s.state.sidebar_collapsed {
